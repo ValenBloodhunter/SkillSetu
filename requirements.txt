@@ -6,3 +6,4 @@ beautifulsoup4
 chromadb
 sentence-transformers
 pandas>=2.2
+playwright
