@@ -11,6 +11,13 @@ from features.livelihood import (
     get_livelihood_summary,
 )
 
+from features.voice import (
+    build_livelihood_voice_response,
+    process_voice_turn,
+    translate_text,
+    text_to_speech,
+)
+
 
 def _split_skills(value):
     if not value:
@@ -40,6 +47,7 @@ def render_livelihood_ui():
             "👤 My Profile",
             "💼 Opportunities",
             "🏛️ Government Schemes",
+            "🎙️ Voice Assistant",
         ]
     )
 
@@ -822,3 +830,258 @@ def render_livelihood_ui():
             "Live myScheme → ChromaDB → RAG. "
             "Jobs use the shared matching_engine()."
         )
+
+    # ==================================================
+    # VOICE ASSISTANT
+    # ==================================================
+
+    with tabs[3]:
+        st.subheader("🎙️ Voice Assistant")
+
+        st.caption(
+            "Speak in Telugu, English, or Hindi. "
+            "Sarvam AI converts your speech to text, "
+            "SkillSetu prepares guidance using your profile, "
+            "and the answer is spoken back to you."
+        )
+
+        profile = st.session_state.get(
+            "livelihood_profile"
+        )
+
+        if not profile:
+            st.warning(
+                "Create and save your livelihood profile "
+                "before using the Voice Assistant."
+            )
+
+        else:
+            preferred_language = getattr(
+                profile,
+                "language",
+                "Telugu",
+            )
+
+            st.info(
+                f"Preferred response language: "
+                f"{preferred_language}"
+            )
+
+            st.markdown("#### 🎤 Speak to SkillSetu")
+
+            recorded_audio = st.audio_input(
+                "Record your question"
+            )
+
+            if recorded_audio is not None:
+                st.audio(recorded_audio)
+
+                if st.button(
+                    "Ask with Voice",
+                    type="primary",
+                    key="livelihood_voice_ask",
+                ):
+                    try:
+                        with st.spinner(
+                            "Listening and preparing your answer..."
+                        ):
+                            audio_bytes = (
+                                recorded_audio.getvalue()
+                            )
+
+                            voice_result = (
+                                process_voice_turn(
+                                    audio_bytes=audio_bytes,
+                                    profile=profile,
+                                    preferred_language=(
+                                        preferred_language
+                                    ),
+                                    suffix=".wav",
+                                )
+                            )
+
+                            st.session_state[
+                                "livelihood_voice_result"
+                            ] = voice_result
+
+                    except Exception as exc:
+                        st.error(
+                            "Voice processing failed. "
+                            "You can still use the text "
+                            "question box below."
+                        )
+
+                        st.caption(
+                            f"Technical detail: {exc}"
+                        )
+
+            voice_result = st.session_state.get(
+                "livelihood_voice_result"
+            )
+
+            if voice_result:
+                st.divider()
+
+                st.markdown("#### 📝 What you said")
+
+                transcript = voice_result.get(
+                    "transcript",
+                    "",
+                )
+
+                st.write(
+                    transcript
+                    or "No transcript was returned."
+                )
+
+                detected_language = voice_result.get(
+                    "detected_language",
+                    "",
+                )
+
+                if detected_language:
+                    st.caption(
+                        "Detected language: "
+                        f"{detected_language}"
+                    )
+
+                st.markdown("#### 🤖 SkillSetu response")
+
+                response_text = voice_result.get(
+                    "response_text",
+                    "",
+                )
+
+                if response_text:
+                    st.write(response_text)
+
+                response_audio = voice_result.get(
+                    "audio_bytes"
+                )
+
+                if response_audio:
+                    st.audio(
+                        response_audio,
+                        format="audio/wav",
+                    )
+
+            st.divider()
+
+            st.markdown("#### ⌨️ Text fallback")
+
+            st.caption(
+                "If microphone permission or speech recognition "
+                "does not work during the demo, type the same "
+                "question here."
+            )
+
+            typed_question = st.text_input(
+                "Ask about jobs, skills, or government schemes",
+                key="livelihood_voice_text_question",
+                placeholder=(
+                    "Example: నాకు ఉద్యోగాలు ఏమైనా ఉన్నాయా?"
+                ),
+            )
+
+            if st.button(
+                "Ask with Text",
+                key="livelihood_text_ask",
+            ):
+                if not typed_question.strip():
+                    st.warning(
+                        "Type a question first."
+                    )
+
+                else:
+                    try:
+                        with st.spinner(
+                            "Preparing your answer..."
+                        ):
+                            english_response = (
+                                build_livelihood_voice_response(
+                                    typed_question,
+                                    profile=profile,
+                                )
+                            )
+
+                            try:
+                                localized_response = (
+                                    translate_text(
+                                        english_response,
+                                        target_language=(
+                                            preferred_language
+                                        ),
+                                    )
+                                )
+
+                            except Exception:
+                                localized_response = (
+                                    english_response
+                                )
+
+                            try:
+                                response_audio = (
+                                    text_to_speech(
+                                        localized_response,
+                                        language=(
+                                            preferred_language
+                                        ),
+                                    )
+                                )
+
+                            except Exception:
+                                response_audio = None
+
+                            st.session_state[
+                                "livelihood_text_voice_result"
+                            ] = {
+                                "question": typed_question,
+                                "response_text": (
+                                    localized_response
+                                ),
+                                "audio_bytes": (
+                                    response_audio
+                                ),
+                            }
+
+                    except Exception as exc:
+                        st.error(
+                            "Could not prepare the response."
+                        )
+
+                        st.caption(
+                            f"Technical detail: {exc}"
+                        )
+
+            text_result = st.session_state.get(
+                "livelihood_text_voice_result"
+            )
+
+            if text_result:
+                st.markdown("#### 🤖 SkillSetu response")
+
+                st.write(
+                    text_result.get(
+                        "response_text",
+                        "",
+                    )
+                )
+
+                text_audio = text_result.get(
+                    "audio_bytes"
+                )
+
+                if text_audio:
+                    st.audio(
+                        text_audio,
+                        format="audio/wav",
+                    )
+
+            st.divider()
+
+            st.caption(
+                "Voice pipeline: Microphone → Sarvam STT → "
+                "SkillSetu livelihood guidance → Sarvam "
+                "translation → Sarvam TTS."
+            )
+
