@@ -1,4 +1,5 @@
 import streamlit as st
+from features.livelihood_ui import render_livelihood_ui
 
 from features.livelihood import (
     create_livelihood_profile,
@@ -77,6 +78,13 @@ if "interview_question" not in st.session_state:
 if "interview_feedback" not in st.session_state:
     st.session_state.interview_feedback = None
 
+# ============================================================
+# LIVELIHOOD EXPERIENCE
+# ============================================================
+
+if st.session_state.persona == "Livelihood Worker":
+    render_livelihood_ui()
+    st.stop()
 
 # ============================================================
 # HEADER
