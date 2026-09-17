@@ -1,0 +1,8 @@
+streamlit
+google-generativeai
+sarvamai
+requests
+beautifulsoup4
+chromadb
+sentence-transformers
+pandas
