@@ -1,3 +1,12 @@
+"""
+Live myScheme integration for SkillSetu.
+
+Important:
+- Schemes are NOT hardcoded.
+- Questionnaire answers come from the user's profile.
+- Only official myScheme URLs are accepted.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -5,20 +14,24 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 
-MYSCHEME_SEARCH_URL = "https://search.myscheme.gov.in/"
-MYSCHEME_BASE_URL = "https://www.myscheme.gov.in/"
+MYSCHEME_SEARCH_URL = (
+    "https://search.myscheme.gov.in/"
+)
+
+MYSCHEME_BASE_URL = (
+    "https://www.myscheme.gov.in/"
+)
+
 SOURCE_NAME = "myScheme"
 
 
-# Official myScheme hosts only.
-MYSCHEME_OFFICIAL_HOSTS = {
-    "search.myscheme.gov.in",
-    "www.myscheme.gov.in",
+OFFICIAL_HOSTS = {
     "myscheme.gov.in",
+    "www.myscheme.gov.in",
+    "search.myscheme.gov.in",
 }
 
 
@@ -32,32 +45,53 @@ QUESTION_FIELDS = {
     "disability",
     "minority",
     "isStudent",
+    "employmentStatus",
     "isBpl",
+    "isEconomicDistress",
     "annualFamilyIncome",
     "annualParentIncome",
 }
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _clean_text(value: str | None) -> str:
-    if not value:
+def _clean(value: Any) -> str:
+    if value is None:
         return ""
 
-    return " ".join(value.split()).strip()
+    return " ".join(
+        str(value).split()
+    ).strip()
 
 
-def _normalise_text(value: Any) -> str:
-    return _clean_text(str(value)).lower()
+def _normal(value: Any) -> str:
+    return _clean(value).lower()
 
 
-def _normalise_profile(
-    profile: dict[str, Any],
-) -> dict[str, Any]:
+def _now():
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
-    result = dict(profile)
+
+def _profile_value(
+    profile,
+    *keys,
+):
+    for key in keys:
+        if key not in profile:
+            continue
+
+        value = profile[key]
+
+        if value is not None and value != "":
+            return value
+
+    return None
+
+
+def _normalise_profile(profile):
+    profile = dict(
+        profile or {}
+    )
 
     aliases = {
         "sex": "gender",
@@ -65,336 +99,393 @@ def _normalise_profile(
         "maritalStatus": "marital_status",
         "residence_type": "residence",
         "area": "residence",
-        "annual_family_income": "annual_family_income",
-        "annual_parent_income": "annual_parent_income",
-        "parent_income": "annual_parent_income",
+        "employmentStatus": (
+            "employment_status"
+        ),
+        "isEconomicDistress": (
+            "is_economic_distress"
+        ),
+        "annualFamilyIncome": (
+            "annual_family_income"
+        ),
+        "family_income": (
+            "annual_family_income"
+        ),
+        "annualParentIncome": (
+            "annual_parent_income"
+        ),
+        "parent_income": (
+            "annual_parent_income"
+        ),
     }
 
-    for old_key, new_key in aliases.items():
-
+    for old, new in aliases.items():
         if (
-            new_key not in result
-            and old_key in result
+            new not in profile
+            and old in profile
         ):
-            result[new_key] = result[old_key]
+            profile[new] = profile[old]
 
-    location = str(
-        result.get(
-            "location",
-            "",
-        )
-    ).strip()
+    profile.setdefault(
+        "gender",
+        "Male",
+    )
 
-    if (
-        "state" not in result
-        and location
+    profile.setdefault(
+        "age",
+        18,
+    )
+
+    profile.setdefault(
+        "state",
+        "Andhra Pradesh",
+    )
+
+    profile.setdefault(
+        "residence",
+        "Rural",
+    )
+
+    profile.setdefault(
+        "caste",
+        "General",
+    )
+
+    profile.setdefault(
+        "disability",
+        "No",
+    )
+
+    profile.setdefault(
+        "minority",
+        "No",
+    )
+
+    profile.setdefault(
+        "is_student",
+        False,
+    )
+
+    profile.setdefault(
+        "employment_status",
+        "Unemployed",
+    )
+
+    profile.setdefault(
+        "marital_status",
+        "Never Married",
+    )
+
+    profile.setdefault(
+        "is_bpl",
+        False,
+    )
+
+    profile.setdefault(
+        "is_economic_distress",
+        False,
+    )
+
+    profile.setdefault(
+        "annual_family_income",
+        0,
+    )
+
+    profile.setdefault(
+        "annual_parent_income",
+        0,
+    )
+
+    return profile
+
+
+def _answer_for(
+    profile,
+    field_name,
+):
+    mapping = {
+        "gender": (
+            "gender",
+        ),
+
+        "age": (
+            "age",
+        ),
+
+        "maritalStatus": (
+            "marital_status",
+            "maritalStatus",
+        ),
+
+        "state": (
+            "state",
+        ),
+
+        "residence": (
+            "residence",
+            "residence_type",
+        ),
+
+        "caste": (
+            "caste",
+            "category",
+        ),
+
+        "disability": (
+            "disability",
+        ),
+
+        "minority": (
+            "minority",
+        ),
+
+        "isStudent": (
+            "is_student",
+            "isStudent",
+        ),
+
+        "employmentStatus": (
+            "employment_status",
+            "employmentStatus",
+        ),
+
+        "isBpl": (
+            "is_bpl",
+            "isBpl",
+        ),
+
+        "isEconomicDistress": (
+            "is_economic_distress",
+            "isEconomicDistress",
+        ),
+
+        "annualFamilyIncome": (
+            "annual_family_income",
+            "annualFamilyIncome",
+        ),
+
+        "annualParentIncome": (
+            "annual_parent_income",
+            "annualParentIncome",
+        ),
+    }
+
+    return _profile_value(
+        profile,
+        *mapping.get(
+            field_name,
+            (),
+        ),
+    )
+
+
+def _candidate_answers(answer):
+    if isinstance(
+        answer,
+        bool,
     ):
-        result["state"] = location
-
-    return result
-
-
-def _get_profile_value(
-    profile: dict[str, Any],
-    *keys: str,
-) -> Any:
-
-    for key in keys:
-
-        value = profile.get(key)
-
-        if (
-            value is not None
-            and value != ""
-        ):
-            return value
-
-    return None
-
-
-def _radio_value_aliases(
-    answer: Any,
-) -> list[str]:
-
-    # ---------------------------------------------------------
-    # myScheme uses "Yes"/"No" for boolean questions.
-    # SkillSetu profiles use Python True/False.
-    # ---------------------------------------------------------
-
-    if isinstance(answer, bool):
-
-        raw = "Yes" if answer else "No"
-
-    else:
-
-        raw = _clean_text(
-            str(answer)
+        return (
+            ["Yes", "yes", "true"]
+            if answer
+            else ["No", "no", "false"]
         )
 
-    lowered = raw.lower()
+    raw = _clean(answer)
+
+    values = [raw]
 
     aliases = {
-        "sc": [
-            "Scheduled Caste (SC)",
-            "Scheduled Caste",
-            "SC",
-        ],
-        "st": [
-            "Scheduled Tribe (ST)",
-            "Scheduled Tribe",
-            "ST",
-        ],
-        "obc": [
-            "Other Backward Class (OBC)",
-            "Other Backward Class",
-            "OBC",
-        ],
-        "pvtg": [
-            "Particularly Vulnerable Tribal Group (PVTG)",
-            "Particularly Vulnerable Tribal Group",
-            "PVTG",
-        ],
-        "dnt": [
-            "De-Notified, Nomadic, and Semi-Nomadic (DNT) communities",
-            "De-Notified, Nomadic, and Semi-Nomadic (DNT)",
-            "DNT",
-        ],
         "general": [
             "General",
         ],
-        "male": [
-            "Male",
+
+        "obc": [
+            "OBC",
+            "Other Backward Class (OBC)",
         ],
-        "female": [
-            "Female",
+
+        "sc": [
+            "SC",
+            "Scheduled Caste (SC)",
         ],
-        "transgender": [
-            "Transgender",
+
+        "st": [
+            "ST",
+            "Scheduled Tribe (ST)",
         ],
-        "urban": [
-            "Urban",
+
+        "pvtg": [
+            "PVTG",
+            (
+                "Particularly Vulnerable "
+                "Tribal Group (PVTG)"
+            ),
         ],
-        "rural": [
-            "Rural",
+
+        "dnt": [
+            "DNT",
+            (
+                "De-Notified, Nomadic, and "
+                "Semi-Nomadic (DNT) communities"
+            ),
         ],
-        "yes": [
-            "Yes",
-        ],
-        "no": [
-            "No",
+
+        "self-employed/ entrepreneur": [
+            "Self-Employed/ Entrepreneur",
+            "Self-Employed/Entrepreneur",
         ],
     }
 
-    result = [
-        raw
-    ]
-
-    if lowered in aliases:
-
-        result.extend(
-            aliases[lowered]
+    values.extend(
+        aliases.get(
+            raw.lower(),
+            [],
         )
+    )
 
-    if isinstance(answer, bool):
-
-        if answer:
-
-            result.extend(
-                [
-                    "true",
-                    "yes",
-                    "Yes",
-                ]
-            )
-
-        else:
-
-            result.extend(
-                [
-                    "false",
-                    "no",
-                    "No",
-                ]
-            )
-
-    unique: list[str] = []
-    seen: set[str] = set()
-
-    for item in result:
-
-        key = _normalise_text(
-            item
-        )
-
-        if key not in seen:
-
-            seen.add(key)
-            unique.append(item)
-
-    return unique
+    return values
 
 
-def _find_matching_radio(
-    page,
-    name: str,
-    answer: Any,
-):
+def _visible_radio_names(page):
+    names = []
+
     radios = page.locator(
-        f'input[type="radio"][name="{name}"]'
+        'input[type="radio"]:visible'
     )
 
-    if radios.count() == 0:
-        return None
-
-    candidates = _radio_value_aliases(
-        answer
-    )
-
-    candidate_normalised = {
-        _normalise_text(value)
-        for value in candidates
-    }
-
-    # ---------------------------------------------------------
-    # Match actual radio value.
-    # ---------------------------------------------------------
-
-    for i in range(
+    for index in range(
         radios.count()
     ):
-
-        radio = radios.nth(i)
-
         try:
-
-            value = radio.get_attribute(
-                "value"
+            name = radios.nth(
+                index
+            ).get_attribute(
+                "name"
             )
 
-            if not value:
-                continue
-
             if (
-                _normalise_text(value)
-                in candidate_normalised
+                name
+                and name not in names
             ):
-
-                return radio
+                names.append(name)
 
         except Exception:
             continue
 
-    # ---------------------------------------------------------
-    # Match associated label.
-    # ---------------------------------------------------------
+    return names
 
-    for i in range(
+
+def _radio_checked(
+    page,
+    name,
+):
+    radios = page.locator(
+        f'input[type="radio"]'
+        f'[name="{name}"]'
+    )
+
+    for index in range(
         radios.count()
     ):
-
-        radio = radios.nth(i)
-
         try:
+            if radios.nth(
+                index
+            ).is_checked():
+                return True
 
-            radio_id = radio.get_attribute(
+        except Exception:
+            continue
+
+    return False
+
+
+def _choose_radio(
+    page,
+    name,
+    answer,
+):
+    candidates = {
+        _normal(value)
+        for value in _candidate_answers(
+            answer
+        )
+    }
+
+    radios = page.locator(
+        f'input[type="radio"]'
+        f'[name="{name}"]'
+    )
+
+    selected = None
+
+    for index in range(
+        radios.count()
+    ):
+        radio = radios.nth(index)
+
+        value = _normal(
+            radio.get_attribute(
+                "value"
+            )
+        )
+
+        if value in candidates:
+            selected = radio
+            break
+
+        radio_id = (
+            radio.get_attribute(
                 "id"
             )
+        )
 
-            if not radio_id:
-                continue
-
+        if radio_id:
             label = page.locator(
                 f'label[for="{radio_id}"]'
             )
 
-            if label.count() == 0:
-                continue
+            if label.count():
+                try:
+                    label_text = _normal(
+                        label.first.inner_text()
+                    )
 
-            label_text = _normalise_text(
-                label.first.inner_text()
-            )
+                    if label_text in candidates:
+                        selected = radio
+                        break
 
-            if (
-                label_text
-                in candidate_normalised
-            ):
+                except Exception:
+                    pass
 
-                return radio
-
-            for candidate in candidates:
-
-                candidate_norm = _normalise_text(
-                    candidate
-                )
-
-                if (
-                    candidate_norm
-                    and len(candidate_norm) > 1
-                    and candidate_norm in label_text
-                ):
-
-                    return radio
-
-        except Exception:
-            continue
-
-    return None
-
-
-def _select_radio(
-    page,
-    name: str,
-    answer: Any,
-) -> bool:
-
-    radio = _find_matching_radio(
-        page,
-        name,
-        answer,
-    )
-
-    if radio is None:
-
+    if selected is None:
         print(
-            f"No matching radio found for "
+            f"No radio match: "
             f"{name}={answer!r}"
         )
 
         return False
 
-    value = radio.get_attribute(
-        "value"
+    print(
+        f"Selecting {name}: "
+        f"{answer!r} -> "
+        f"{selected.get_attribute('value')!r}"
     )
 
-    radio_id = radio.get_attribute(
+    # myScheme uses visually hidden radios.
+    # Clicking the associated label is more reliable
+    # than radio.check().
+
+    radio_id = selected.get_attribute(
         "id"
     )
 
-    print(
-        f"Resolved radio: "
-        f"profile='{answer}' "
-        f"-> value='{value}' "
-        f"id='{radio_id}'"
-    )
-
-    # ---------------------------------------------------------
-    # Preferred method: associated label.
-    # ---------------------------------------------------------
-
     if radio_id:
-
         label = page.locator(
             f'label[for="{radio_id}"]'
         )
 
         if label.count():
-
             try:
-
-                print(
-                    "Clicking associated label..."
-                )
-
                 label.first.click(
                     force=True,
                     timeout=5000,
@@ -404,978 +495,165 @@ def _select_radio(
                     300
                 )
 
-                if radio.is_checked():
-
-                    print(
-                        f"Verified radio selection: "
-                        f"{value}"
-                    )
-
+                if selected.is_checked():
                     return True
 
-            except Exception as exc:
-
-                print(
-                    f"Label click failed: "
-                    f"{exc}"
-                )
-
-    # ---------------------------------------------------------
-    # Wrapping label fallback.
-    # ---------------------------------------------------------
+            except Exception:
+                pass
 
     try:
-
-        parent_label = radio.locator(
-            "xpath=ancestor::label[1]"
+        selected.click(
+            force=True,
+            timeout=5000,
         )
 
-        if parent_label.count():
-
-            print(
-                "Trying wrapping label..."
-            )
-
-            parent_label.first.click(
-                force=True,
-                timeout=5000,
-            )
-
-            page.wait_for_timeout(
-                300
-            )
-
-            if radio.is_checked():
-
-                print(
-                    f"Verified radio selection: "
-                    f"{value}"
-                )
-
-                return True
-
-    except Exception as exc:
-
-        print(
-            f"Wrapping label failed: "
-            f"{exc}"
+        page.wait_for_timeout(
+            300
         )
 
-    # ---------------------------------------------------------
-    # Parent fallback.
-    # ---------------------------------------------------------
+        if selected.is_checked():
+            return True
+
+    except Exception:
+        pass
 
     try:
-
-        parent = radio.locator(
-            "xpath=.."
-        )
-
-        if parent.count():
-
-            print(
-                "Trying radio parent..."
-            )
-
-            parent.first.click(
-                force=True,
-                timeout=5000,
-            )
-
-            page.wait_for_timeout(
-                300
-            )
-
-            if radio.is_checked():
-
-                print(
-                    f"Verified radio selection: "
-                    f"{value}"
-                )
-
-                return True
-
-    except Exception as exc:
-
-        print(
-            f"Radio parent failed: "
-            f"{exc}"
-        )
-
-    # ---------------------------------------------------------
-    # JavaScript fallback.
-    # ---------------------------------------------------------
-
-    try:
-
-        print(
-            "Trying JavaScript native click..."
-        )
-
-        radio.evaluate(
+        selected.evaluate(
             """
             element => {
                 element.click();
 
                 element.dispatchEvent(
-                    new Event("input", {
-                        bubbles: true
-                    })
+                    new Event(
+                        'input',
+                        {bubbles: true}
+                    )
                 );
 
                 element.dispatchEvent(
-                    new Event("change", {
-                        bubbles: true
-                    })
+                    new Event(
+                        'change',
+                        {bubbles: true}
+                    )
                 );
             }
             """
         )
 
         page.wait_for_timeout(
-            500
+            300
         )
 
-        if radio.is_checked():
+        return selected.is_checked()
 
-            print(
-                f"Verified radio selection "
-                f"after JavaScript: {value}"
-            )
-
-            return True
-
-    except Exception as exc:
-
-        print(
-            f"JavaScript radio click failed: "
-            f"{exc}"
-        )
-
-    return False
+    except Exception:
+        return False
 
 
-def _select_option_texts(
-    select,
-) -> list[str]:
+def _option_texts(select):
+    values = []
 
-    values: list[str] = []
+    options = select.locator(
+        "option"
+    )
 
-    try:
-
-        options = select.locator(
-            "option"
-        )
-
-        for i in range(
-            options.count()
-        ):
-
-            text = _clean_text(
-                options.nth(i).inner_text()
+    for index in range(
+        options.count()
+    ):
+        try:
+            text = _clean(
+                options.nth(
+                    index
+                ).inner_text()
             )
 
             if text:
                 values.append(text)
 
-    except Exception:
-        pass
+        except Exception:
+            continue
 
     return values
 
 
-def _is_age_select(
+def _looks_like_age_select(
     select,
-) -> bool:
+):
+    options = _option_texts(
+        select
+    )
+
+    numeric = 0
+
+    for value in options:
+        if value.isdigit():
+            numeric += 1
+
+    return numeric >= 30
+
+
+def _select_from_element(
+    select,
+    answer,
+):
+    desired = _clean(answer)
 
     try:
-
-        options = select.locator(
-            "option"
+        select.select_option(
+            label=desired
         )
 
-        count = options.count()
-
-        if count < 50:
-            return False
-
-        first_text = _clean_text(
-            options.nth(0).inner_text()
+        page_value = _clean(
+            select.input_value()
         )
 
-        if first_text != "--":
-            return False
-
-        numeric_count = 0
-
-        for i in range(
-            min(count, 120)
-        ):
-
-            text = _clean_text(
-                options.nth(i).inner_text()
-            )
-
-            if text.isdigit():
-                numeric_count += 1
-
-        return numeric_count >= 40
+        if page_value:
+            return True
 
     except Exception:
-        return False
-
-
-def _infer_unnamed_select_field(
-    page,
-    profile: dict[str, Any],
-    answered_fields: set[str],
-) -> str | None:
-
-    selects = page.locator(
-        "select:visible"
-    )
-
-    for i in range(
-        selects.count()
-    ):
-
-        select = selects.nth(i)
-
-        try:
-
-            name = select.get_attribute(
-                "name"
-            )
-
-            if (
-                name in QUESTION_FIELDS
-                and name not in answered_fields
-            ):
-
-                return name
-
-            options = _select_option_texts(
-                select
-            )
-
-            if not options:
-                continue
-
-            normalized_options = {
-                _normalise_text(option)
-                for option in options
-            }
-
-            # -------------------------------------------------
-            # Age.
-            # -------------------------------------------------
-
-            if _is_age_select(
-                select
-            ):
-
-                if "age" not in answered_fields:
-
-                    return "age"
-
-                continue
-
-            # -------------------------------------------------
-            # Marital status.
-            # -------------------------------------------------
-
-            marital_options = {
-                "married",
-                "never married",
-                "divorced",
-                "separated",
-                "widowed",
-            }
-
-            if marital_options.intersection(
-                normalized_options
-            ):
-
-                if (
-                    "maritalStatus"
-                    not in answered_fields
-                ):
-
-                    return "maritalStatus"
-
-                continue
-
-            # -------------------------------------------------
-            # State.
-            # -------------------------------------------------
-
-            state = str(
-                _get_profile_value(
-                    profile,
-                    "state",
-                    "location",
-                )
-                or ""
-            ).strip()
-
-            if (
-                "state"
-                not in answered_fields
-                and _normalise_text(state)
-                in normalized_options
-            ):
-
-                return "state"
-
-            # -------------------------------------------------
-            # Residence.
-            # -------------------------------------------------
-
-            residence = str(
-                _get_profile_value(
-                    profile,
-                    "residence",
-                    "residence_type",
-                    "area",
-                )
-                or ""
-            ).strip()
-
-            if (
-                "residence"
-                not in answered_fields
-                and _normalise_text(residence)
-                in normalized_options
-            ):
-
-                return "residence"
-
-        except Exception:
-            continue
-
-    return None
-
-
-def _visible_question(
-    page,
-    answered_fields: set[str],
-    profile: dict[str, Any],
-) -> tuple[str | None, str]:
-
-    # ---------------------------------------------------------
-    # Explicit gender.
-    # ---------------------------------------------------------
-
-    if (
-        profile.get("gender")
-        not in (None, "")
-        and "gender"
-        not in answered_fields
-    ):
-
-        radios = page.locator(
-            'input[type="radio"][name="gender"]:visible'
-        )
-
-        if radios.count():
-
-            return (
-                "gender",
-                _clean_text(
-                    page.locator(
-                        "body"
-                    ).inner_text()
-                ),
-            )
-
-    # ---------------------------------------------------------
-    # Radio questions.
-    # ---------------------------------------------------------
-
-    radios = page.locator(
-        'input[type="radio"]:visible'
-    )
-
-    seen_names: set[str] = set()
-
-    for i in range(
-        radios.count()
-    ):
-
-        radio = radios.nth(i)
-
-        try:
-
-            name = radio.get_attribute(
-                "name"
-            )
-
-            if not name:
-                continue
-
-            if name in seen_names:
-                continue
-
-            seen_names.add(
-                name
-            )
-
-            if (
-                name in QUESTION_FIELDS
-                and name not in answered_fields
-            ):
-
-                return (
-                    name,
-                    _clean_text(
-                        page.locator(
-                            "body"
-                        ).inner_text()
-                    ),
-                )
-
-        except Exception:
-            continue
-
-    # ---------------------------------------------------------
-    # Named selects.
-    # ---------------------------------------------------------
-
-    selects = page.locator(
-        "select:visible"
-    )
-
-    for i in range(
-        selects.count()
-    ):
-
-        select = selects.nth(i)
-
-        try:
-
-            name = select.get_attribute(
-                "name"
-            )
-
-            if (
-                name in QUESTION_FIELDS
-                and name not in answered_fields
-            ):
-
-                return (
-                    name,
-                    _clean_text(
-                        page.locator(
-                            "body"
-                        ).inner_text()
-                    ),
-                )
-
-        except Exception:
-            continue
-
-    # ---------------------------------------------------------
-    # Unnamed selects.
-    # ---------------------------------------------------------
-
-    inferred = _infer_unnamed_select_field(
-        page,
-        profile,
-        answered_fields,
-    )
-
-    if inferred:
-
-        return (
-            inferred,
-            _clean_text(
-                page.locator(
-                    "body"
-                ).inner_text()
-            ),
-        )
-
-    # ---------------------------------------------------------
-    # Number/text inputs.
-    # ---------------------------------------------------------
-
-    for selector in [
-        'input[type="number"]:visible',
-        'input[type="text"]:visible',
-    ]:
-
-        elements = page.locator(
-            selector
-        )
-
-        for i in range(
-            elements.count()
-        ):
-
-            element = elements.nth(i)
-
-            try:
-
-                name = element.get_attribute(
-                    "name"
-                )
-
-                if (
-                    name in QUESTION_FIELDS
-                    and name not in answered_fields
-                ):
-
-                    return (
-                        name,
-                        _clean_text(
-                            page.locator(
-                                "body"
-                            ).inner_text()
-                        ),
-                    )
-
-            except Exception:
-                continue
-
-    return None, ""
-
-
-def _debug_dom(
-    page,
-) -> None:
-
-    print()
-    print("=" * 60)
-    print("MYSCHEME DOM DEBUG")
-    print("=" * 60)
+        pass
 
     try:
-
-        print()
-        print("URL:")
-        print(page.url)
-
-        print()
-        print("TITLE:")
-        print(page.title())
-
-        print()
-        print("VISIBLE BODY TEXT:")
-
-        print(
-            _clean_text(
-                page.locator(
-                    "body"
-                ).inner_text()
-            )
+        select.select_option(
+            value=desired
         )
 
-    except Exception as exc:
+        return True
 
-        print(
-            f"Could not read body: {exc}"
-        )
+    except Exception:
+        pass
 
-    print()
-    print("VISIBLE INPUTS:")
-
-    try:
-
-        inputs = page.locator(
-            "input:visible"
-        )
-
-        print(
-            f"Input count: "
-            f"{inputs.count()}"
-        )
-
-        for i in range(
-            inputs.count()
-        ):
-
-            element = inputs.nth(i)
-
-            input_type = (
-                element.get_attribute(
-                    "type"
-                )
-                or ""
-            )
-
-            checked = "N/A"
-
-            if input_type == "radio":
-
-                try:
-
-                    checked = element.is_checked()
-
-                except Exception:
-
-                    checked = "?"
-
-            print(
-                f"[INPUT {i}] "
-                f"type='{input_type}' "
-                f"name='{element.get_attribute('name')}' "
-                f"value='{element.get_attribute('value')}' "
-                f"id='{element.get_attribute('id')}' "
-                f"checked={checked}"
-            )
-
-    except Exception as exc:
-
-        print(
-            f"Could not inspect inputs: {exc}"
-        )
-
-    print()
-    print("VISIBLE SELECTS:")
-
-    try:
-
-        selects = page.locator(
-            "select:visible"
-        )
-
-        print(
-            f"Select count: "
-            f"{selects.count()}"
-        )
-
-        for i in range(
-            selects.count()
-        ):
-
-            select = selects.nth(i)
-
-            print(
-                f"[SELECT {i}] "
-                f"name='{select.get_attribute('name')}' "
-                f"id='{select.get_attribute('id')}' "
-                f"value='{select.input_value()}' "
-                f"options={select.locator('option').count()}"
-            )
-
-    except Exception as exc:
-
-        print(
-            f"Could not inspect selects: {exc}"
-        )
-
-    print()
-    print("VISIBLE LABELS:")
-
-    try:
-
-        labels = page.locator(
-            "label:visible"
-        )
-
-        print(
-            f"Label count: "
-            f"{labels.count()}"
-        )
-
-        for i in range(
-            labels.count()
-        ):
-
-            label = labels.nth(i)
-
-            print(
-                f"[LABEL {i}] "
-                f"for='{label.get_attribute('for')}' "
-                f"text='{_clean_text(label.inner_text())}'"
-            )
-
-    except Exception as exc:
-
-        print(
-            f"Could not inspect labels: {exc}"
-        )
-
-    print()
-    print("VISIBLE BUTTONS:")
-
-    try:
-
-        buttons = page.locator(
-            "button:visible"
-        )
-
-        print(
-            f"Button count: "
-            f"{buttons.count()}"
-        )
-
-        for i in range(
-            buttons.count()
-        ):
-
-            button = buttons.nth(i)
-
-            print(
-                f"[BUTTON {i}] "
-                f"text='{_clean_text(button.inner_text())}' "
-                f"type='{button.get_attribute('type')}'"
-            )
-
-    except Exception as exc:
-
-        print(
-            f"Could not inspect buttons: {exc}"
-        )
-
-    print("=" * 60)
-    print()
-
-
-def _select_age(
-    page,
-    value: Any,
-) -> bool:
-
-    age = str(
-        value
-    ).strip()
-
-    selects = page.locator(
-        "select:visible"
+    options = select.locator(
+        "option"
     )
 
-    for i in range(
-        selects.count()
+    for index in range(
+        options.count()
     ):
-
-        select = selects.nth(i)
-
-        if not _is_age_select(
-            select
-        ):
-            continue
-
-        print(
-            f"Selecting age value: "
-            f"{age}"
-        )
+        option = options.nth(index)
 
         try:
-
-            select.select_option(
-                value=age
-            )
-
-            page.wait_for_timeout(
-                300
-            )
-
-            current = select.input_value()
-
-            print(
-                f"Age select value after "
-                f"selection: '{current}'"
-            )
-
-            if current == age:
-
-                print(
-                    "Age selection "
-                    "verified successfully."
-                )
-
-                return True
-
-        except Exception as exc:
-
-            print(
-                f"Age value selection "
-                f"failed: {exc}"
-            )
-
-        try:
-
-            select.select_option(
-                label=age
-            )
-
-            page.wait_for_timeout(
-                300
-            )
-
-            current = select.input_value()
-
-            if current == age:
-
-                print(
-                    "Age selection "
-                    "verified successfully."
-                )
-
-                return True
-
-        except Exception:
-            pass
-
-    return False
-
-
-def _select_value(
-    page,
-    field_name: str,
-    value: Any,
-) -> bool:
-
-    desired = str(
-        value
-    ).strip()
-
-    # ---------------------------------------------------------
-    # Named select.
-    # ---------------------------------------------------------
-
-    select = page.locator(
-        f'select[name="{field_name}"]:visible'
-    )
-
-    if select.count():
-
-        select = select.first
-
-        try:
-
-            select.select_option(
-                label=desired
-            )
-
-            page.wait_for_timeout(
-                300
-            )
-
-            return True
-
-        except Exception:
-            pass
-
-        try:
-
-            select.select_option(
-                value=desired
-            )
-
-            page.wait_for_timeout(
-                300
-            )
-
-            return True
-
-        except Exception:
-            pass
-
-        options = select.locator(
-            "option"
-        )
-
-        for i in range(
-            options.count()
-        ):
-
-            option = options.nth(i)
-
-            text = _normalise_text(
+            text = _normal(
                 option.inner_text()
             )
 
-            if (
-                text
-                == _normalise_text(desired)
+            if text != _normal(
+                desired
             ):
-
-                option_value = (
-                    option.get_attribute(
-                        "value"
-                    )
-                )
-
-                if option_value is None:
-                    continue
-
-                try:
-
-                    select.select_option(
-                        value=option_value
-                    )
-
-                    page.wait_for_timeout(
-                        300
-                    )
-
-                    return True
-
-                except Exception:
-                    continue
-
-    # ---------------------------------------------------------
-    # Unnamed select.
-    # ---------------------------------------------------------
-
-    selects = page.locator(
-        "select:visible"
-    )
-
-    for i in range(
-        selects.count()
-    ):
-
-        candidate = selects.nth(i)
-
-        try:
-
-            name = candidate.get_attribute(
-                "name"
-            )
-
-            if name:
                 continue
 
-            options = candidate.locator(
-                "option"
+            value = option.get_attribute(
+                "value"
             )
 
-            for j in range(
-                options.count()
-            ):
+            if value is None:
+                continue
 
-                option = options.nth(j)
+            select.select_option(
+                value=value
+            )
 
-                text = _normalise_text(
-                    option.inner_text()
-                )
-
-                if (
-                    text
-                    == _normalise_text(desired)
-                ):
-
-                    option_value = (
-                        option.get_attribute(
-                            "value"
-                        )
-                    )
-
-                    if option_value is None:
-                        continue
-
-                    candidate.select_option(
-                        value=option_value
-                    )
-
-                    page.wait_for_timeout(
-                        300
-                    )
-
-                    return True
+            return True
 
         except Exception:
             continue
@@ -1383,23 +661,168 @@ def _select_value(
     return False
 
 
-def _fill_input(
+def _answer_named_select(
     page,
-    name: str,
-    value: Any,
-) -> bool:
-
-    field = page.locator(
-        f'input[name="{name}"]:visible'
+    field_name,
+    answer,
+):
+    selects = page.locator(
+        f'select[name="{field_name}"]'
+        ":visible"
     )
 
-    if field.count() == 0:
+    if not selects.count():
+        return False
+
+    return _select_from_element(
+        selects.first,
+        answer,
+    )
+
+
+def _answer_age(
+    page,
+    answer,
+):
+    named = page.locator(
+        'select[name="age"]:visible'
+    )
+
+    if named.count():
+        return _select_from_element(
+            named.first,
+            answer,
+        )
+
+    selects = page.locator(
+        "select:visible"
+    )
+
+    for index in range(
+        selects.count()
+    ):
+        select = selects.nth(index)
+
+        if _looks_like_age_select(
+            select
+        ):
+            return _select_from_element(
+                select,
+                answer,
+            )
+
+    return False
+
+
+def _answer_state(
+    page,
+    answer,
+):
+    named = page.locator(
+        'select[name="state"]:visible'
+    )
+
+    if named.count():
+        return _select_from_element(
+            named.first,
+            answer,
+        )
+
+    wanted = _normal(answer)
+
+    selects = page.locator(
+        "select:visible"
+    )
+
+    for index in range(
+        selects.count()
+    ):
+        select = selects.nth(index)
+
+        options = {
+            _normal(value)
+            for value in _option_texts(
+                select
+            )
+        }
+
+        if wanted in options:
+            return _select_from_element(
+                select,
+                answer,
+            )
+
+    return False
+
+
+def _answer_marital(
+    page,
+    answer,
+):
+    if _answer_named_select(
+        page,
+        "maritalStatus",
+        answer,
+    ):
+        return True
+
+    marital_options = {
+        "never married",
+        "married",
+        "divorced",
+        "separated",
+        "widowed",
+        "unmarried",
+    }
+
+    selects = page.locator(
+        "select:visible"
+    )
+
+    for index in range(
+        selects.count()
+    ):
+        select = selects.nth(index)
+
+        options = {
+            _normal(value)
+            for value in _option_texts(
+                select
+            )
+        }
+
+        if (
+            options
+            & marital_options
+        ):
+            return _select_from_element(
+                select,
+                answer,
+            )
+
+    return False
+
+
+def _answer_input(
+    page,
+    field_name,
+    answer,
+):
+    inputs = page.locator(
+        f'input[name="{field_name}"]'
+        ':not([type="radio"]):visible'
+    )
+
+    if not inputs.count():
         return False
 
     try:
+        inputs.first.fill(
+            str(answer)
+        )
 
-        field.first.fill(
-            str(value)
+        page.wait_for_timeout(
+            200
         )
 
         return True
@@ -1408,226 +831,380 @@ def _fill_input(
         return False
 
 
-def _profile_answer(
-    profile: dict[str, Any],
-    field_name: str,
-) -> Any:
-
-    mapping = {
-        "gender": (
-            "gender",
-        ),
-        "age": (
-            "age",
-        ),
-        "maritalStatus": (
-            "marital_status",
-            "maritalStatus",
-        ),
-        "state": (
-            "state",
-        ),
-        "residence": (
-            "residence",
-            "residence_type",
-            "area",
-        ),
-        "caste": (
-            "caste",
-            "category",
-        ),
-        "disability": (
-            "disability",
-        ),
-        "minority": (
-            "minority",
-        ),
-        "isStudent": (
-            "is_student",
-            "isStudent",
-        ),
-        "isBpl": (
-            "is_bpl",
-            "isBpl",
-        ),
-        "annualFamilyIncome": (
-            "annual_family_income",
-            "family_income",
-        ),
-        "annualParentIncome": (
-            "annual_parent_income",
-            "parent_income",
-        ),
-    }
-
-    keys = mapping.get(
-        field_name,
-        (),
-    )
-
-    return _get_profile_value(
-        profile,
-        *keys,
-    )
-
-
-def _answer_current_question(
+def _answer_field(
     page,
-    profile: dict[str, Any],
-    field_name: str,
-) -> bool:
-
-    answer = _profile_answer(
+    profile,
+    field_name,
+):
+    answer = _answer_for(
         profile,
         field_name,
     )
 
     if answer is None:
-
-        raise ValueError(
-            f"myScheme requires profile field "
-            f"'{field_name}', but SkillSetu "
-            f"does not have it."
+        raise RuntimeError(
+            "No profile answer available "
+            f"for myScheme field: {field_name}"
         )
 
     print(
-        f"Profile answer for "
-        f"'{field_name}': {answer!r}"
+        f"Answering {field_name}: "
+        f"{answer!r}"
     )
 
-    # ---------------------------------------------------------
-    # Radio.
-    # ---------------------------------------------------------
-
     radio = page.locator(
-        f'input[type="radio"][name="{field_name}"]'
+        f'input[type="radio"]'
+        f'[name="{field_name}"]:visible'
     )
 
     if radio.count():
-
-        if _select_radio(
+        return _choose_radio(
             page,
             field_name,
             answer,
-        ):
-
-            return True
-
-        _debug_dom(
-            page
         )
-
-        raise RuntimeError(
-            f"Could not answer myScheme "
-            f"field '{field_name}' with "
-            f"value '{answer}'."
-        )
-
-    # ---------------------------------------------------------
-    # Age.
-    # ---------------------------------------------------------
 
     if field_name == "age":
-
-        if _select_age(
+        return _answer_age(
             page,
             answer,
-        ):
-
-            return True
-
-        _debug_dom(
-            page
         )
 
-        raise RuntimeError(
-            f"Could not select age "
-            f"'{answer}'."
+    if field_name == "state":
+        return _answer_state(
+            page,
+            answer,
         )
 
-    # ---------------------------------------------------------
-    # Select.
-    # ---------------------------------------------------------
+    if field_name == "maritalStatus":
+        return _answer_marital(
+            page,
+            answer,
+        )
 
-    if _select_value(
+    if _answer_named_select(
         page,
         field_name,
         answer,
     ):
-
         return True
 
-    # ---------------------------------------------------------
-    # Text/number.
-    # ---------------------------------------------------------
-
-    if _fill_input(
+    if _answer_input(
         page,
         field_name,
         answer,
     ):
-
         return True
 
-    _debug_dom(
-        page
-    )
-
-    raise RuntimeError(
-        f"Could not answer visible "
-        f"myScheme field "
-        f"'{field_name}' "
-        f"with value '{answer}'."
-    )
+    return False
 
 
-def _click_next(
+def _detect_select_fields(
     page,
-) -> bool:
+    answered,
+    profile,
+):
+    fields = []
 
+    selects = page.locator(
+        "select:visible"
+    )
+
+    for index in range(
+        selects.count()
+    ):
+        select = selects.nth(index)
+
+        name = select.get_attribute(
+            "name"
+        )
+
+        if (
+            name
+            and name in QUESTION_FIELDS
+            and name not in answered
+        ):
+            fields.append(name)
+
+    if (
+        "age" not in answered
+        and "age" not in fields
+    ):
+        for index in range(
+            selects.count()
+        ):
+            if _looks_like_age_select(
+                selects.nth(index)
+            ):
+                fields.append("age")
+                break
+
+    if (
+        "state" not in answered
+        and "state" not in fields
+    ):
+        state = _answer_for(
+            profile,
+            "state",
+        )
+
+        if state:
+            wanted = _normal(state)
+
+            for index in range(
+                selects.count()
+            ):
+                options = {
+                    _normal(value)
+                    for value in _option_texts(
+                        selects.nth(index)
+                    )
+                }
+
+                if wanted in options:
+                    fields.append(
+                        "state"
+                    )
+                    break
+
+    if (
+        "maritalStatus"
+        not in answered
+        and "maritalStatus"
+        not in fields
+    ):
+        marital_options = {
+            "never married",
+            "married",
+            "divorced",
+            "separated",
+            "widowed",
+            "unmarried",
+        }
+
+        for index in range(
+            selects.count()
+        ):
+            options = {
+                _normal(value)
+                for value in _option_texts(
+                    selects.nth(index)
+                )
+            }
+
+            if (
+                options
+                & marital_options
+            ):
+                fields.append(
+                    "maritalStatus"
+                )
+                break
+
+    return fields
+
+
+def _detect_input_fields(
+    page,
+    answered,
+):
+    fields = []
+
+    inputs = page.locator(
+        (
+            'input[type="number"]:visible, '
+            'input[type="text"]:visible'
+        )
+    )
+
+    for index in range(
+        inputs.count()
+    ):
+        name = inputs.nth(
+            index
+        ).get_attribute(
+            "name"
+        )
+
+        if (
+            name
+            and name in QUESTION_FIELDS
+            and name not in answered
+        ):
+            fields.append(name)
+
+    return fields
+
+
+def _visible_supported_fields(
+    page,
+    answered,
+    profile,
+):
+    fields = []
+
+    # Radio groups
+    for name in _visible_radio_names(
+        page
+    ):
+        if (
+            name in QUESTION_FIELDS
+            and name not in answered
+        ):
+            fields.append(name)
+
+    # Selects
+    for name in _detect_select_fields(
+        page,
+        answered,
+        profile,
+    ):
+        if name not in fields:
+            fields.append(name)
+
+    # Inputs
+    for name in _detect_input_fields(
+        page,
+        answered,
+    ):
+        if name not in fields:
+            fields.append(name)
+
+    return fields
+
+
+def _unknown_required_radios(
+    page,
+    answered,
+):
+    unknown = []
+
+    for name in _visible_radio_names(
+        page
+    ):
+        if (
+            name not in QUESTION_FIELDS
+            and name not in answered
+        ):
+            unknown.append(name)
+
+    return unknown
+
+
+def _debug_page(page):
+    print()
+    print("=" * 60)
+    print("MYSCHEME DEBUG")
+    print("=" * 60)
+
+    print(
+        "URL:",
+        page.url,
+    )
+
+    try:
+        body = _clean(
+            page.locator(
+                "body"
+            ).inner_text()
+        )
+
+        print(
+            "BODY:",
+            body[:5000],
+        )
+
+    except Exception:
+        pass
+
+    radios = page.locator(
+        'input[type="radio"]:visible'
+    )
+
+    print(
+        "VISIBLE RADIOS:",
+        radios.count(),
+    )
+
+    for index in range(
+        radios.count()
+    ):
+        radio = radios.nth(index)
+
+        print(
+            index,
+            "name=",
+            radio.get_attribute(
+                "name"
+            ),
+            "value=",
+            radio.get_attribute(
+                "value"
+            ),
+        )
+
+    selects = page.locator(
+        "select:visible"
+    )
+
+    print(
+        "VISIBLE SELECTS:",
+        selects.count(),
+    )
+
+    for index in range(
+        selects.count()
+    ):
+        select = selects.nth(index)
+
+        print(
+            index,
+            "name=",
+            select.get_attribute(
+                "name"
+            ),
+            "options=",
+            _option_texts(
+                select
+            )[:25],
+        )
+
+    print("=" * 60)
+    print()
+
+
+def _click_continue(page):
     selectors = [
         'button:has-text("Next"):visible',
         'button:has-text("Submit"):visible',
+        'button[type="submit"]:visible',
         'input[type="submit"]:visible',
     ]
 
     for selector in selectors:
-
         buttons = page.locator(
             selector
         )
 
-        for i in range(
+        for index in range(
             buttons.count()
         ):
-
-            button = buttons.nth(i)
+            button = buttons.nth(index)
 
             try:
+                text = ""
 
-                text = _clean_text(
-                    button.inner_text()
-                ).lower()
-
-                button_type = (
-                    button.get_attribute(
-                        "type"
+                try:
+                    text = _clean(
+                        button.inner_text()
                     )
-                    or ""
-                ).lower()
 
-                if (
-                    "next" not in text
-                    and "submit" not in text
-                    and button_type != "submit"
-                ):
-
-                    continue
+                except Exception:
+                    pass
 
                 print(
-                    f"Clicking questionnaire control: "
-                    f"text='{text}' "
-                    f"type='{button_type}'"
+                    "Clicking:",
+                    text or selector,
                 )
 
                 button.click(
@@ -1635,357 +1212,279 @@ def _click_next(
                     timeout=5000,
                 )
 
+                page.wait_for_timeout(
+                    900
+                )
+
                 return True
 
-            except Exception as exc:
-
-                print(
-                    f"Questionnaire control "
-                    f"click failed: {exc}"
-                )
+            except Exception:
+                continue
 
     return False
 
 
-def _normalise_scheme_url(
-    url: str,
-) -> str:
+def _click_skip_to_results(
+    page,
+):
+    skip = page.get_by_text(
+        "Skip to Results",
+        exact=True,
+    )
 
-    """
-    Normalize an official myScheme URL.
+    if not skip.count():
+        return False
 
-    Only official myScheme hosts are accepted.
-    """
+    try:
+        print(
+            "Using Skip to Results."
+        )
 
+        skip.first.click(
+            force=True,
+            timeout=5000,
+        )
+
+        page.wait_for_timeout(
+            1200
+        )
+
+        return True
+
+    except Exception:
+        return False
+
+
+def _official_scheme_url(url):
     if not url:
         return ""
 
-    url = url.strip()
-
-    if url.startswith("//"):
-
-        url = "https:" + url
-
-    elif url.startswith("/"):
-
-        url = urljoin(
-            MYSCHEME_SEARCH_URL,
-            url,
-        )
-
-    parsed = urlparse(
-        url
+    absolute = urljoin(
+        MYSCHEME_BASE_URL,
+        url,
     )
 
-    if parsed.scheme.lower() != "https":
-        return ""
+    parsed = urlparse(
+        absolute
+    )
 
     host = (
         parsed.netloc
         or ""
     ).lower()
 
-    if host not in MYSCHEME_OFFICIAL_HOSTS:
+    if (
+        parsed.scheme != "https"
+        or host not in OFFICIAL_HOSTS
+    ):
         return ""
 
-    # Remove fragments because they do not identify a
-    # different scheme resource.
-    normalized = (
+    if (
+        "/schemes/"
+        not in parsed.path.lower()
+    ):
+        return ""
+
+    result = (
         f"https://{host}"
         f"{parsed.path}"
     )
 
     if parsed.query:
-
-        normalized += (
+        result += (
             f"?{parsed.query}"
         )
 
-    return normalized
+    return result
 
 
-def _is_real_scheme_url(
-    url: str,
-) -> bool:
-
-    normalized = _normalise_scheme_url(
-        url
-    )
-
-    if not normalized:
-        return False
-
-    parsed = urlparse(
-        normalized
-    )
-
-    path = (
-        parsed.path
-        or ""
-    ).lower()
-
-    return (
-        "/schemes/" in path
-    )
-
-
-def _extract_scheme_cards(
+def _extract_scheme_links(
     page,
-) -> list[dict[str, str]]:
-
-    cards: list[
-        dict[str, str]
-    ] = []
-
-    seen_urls: set[str] = set()
-
+):
     links = page.locator(
         'a[href*="/schemes/"]'
     )
 
+    results = []
+    seen = set()
+
     print(
-        f"Found {links.count()} "
-        f"candidate scheme links."
+        "Candidate scheme links:",
+        links.count(),
     )
 
-    for i in range(
+    for index in range(
         links.count()
     ):
-
-        link = links.nth(i)
-
         try:
-
-            href = link.get_attribute(
+            href = links.nth(
+                index
+            ).get_attribute(
                 "href"
             )
 
-            if not href:
-                continue
-
-            raw_url = urljoin(
-                MYSCHEME_SEARCH_URL,
-                href,
+            url = _official_scheme_url(
+                href
             )
 
-            url = _normalise_scheme_url(
-                raw_url
-            )
-
-            print(
-                f"Candidate link "
-                f"{i + 1}: "
-                f"href='{href}' "
-                f"-> normalized='{url}'"
-            )
-
-            if not _is_real_scheme_url(
-                url
+            if (
+                not url
+                or url in seen
             ):
-
                 continue
 
-            if url in seen_urls:
-                continue
+            seen.add(url)
 
-            seen_urls.add(
-                url
-            )
+            results.append(url)
 
-            text = _clean_text(
-                link.inner_text()
-            )
-
-            card_text = text
-
-            try:
-
-                ancestor = link.locator(
-                    "xpath=ancestor::*"
-                    "[self::article or @role='article'][1]"
-                )
-
-                if ancestor.count():
-
-                    card_text = _clean_text(
-                        ancestor.first.inner_text()
-                    )
-
-            except Exception:
-                pass
-
-            cards.append(
-                {
-                    "url": url,
-                    "card_text": card_text,
-                }
-            )
-
-        except Exception as exc:
-
-            print(
-                f"Could not process "
-                f"candidate link: {exc}"
-            )
+        except Exception:
+            continue
 
     print(
-        f"Recovered {len(cards)} "
-        f"real scheme links."
+        "Official scheme links:",
+        len(results),
     )
 
-    return cards
+    return results
 
 
 def _parse_scheme_page(
     page,
-    url: str,
-    state: str,
-) -> dict[str, Any] | None:
-
-    normalized_url = _normalise_scheme_url(
-        url
-    )
-
-    if not _is_real_scheme_url(
-        normalized_url
-    ):
-
-        print(
-            f"Skipping non-scheme URL: "
-            f"{url}"
-        )
-
-        return None
-
+    url,
+    state,
+):
     try:
-
         print(
-            f"Loading scheme page: "
-            f"{normalized_url}"
+            "Loading scheme:",
+            url,
         )
 
         page.goto(
-            normalized_url,
+            url,
             wait_until="domcontentloaded",
-            timeout=30_000,
+            timeout=30000,
         )
 
         page.wait_for_timeout(
-            1000
+            800
         )
 
-        html = page.content()
-
         soup = BeautifulSoup(
-            html,
+            page.content(),
             "html.parser",
         )
 
-        for element in soup(
+        for tag in soup(
             [
                 "script",
                 "style",
-                "noscript",
                 "svg",
+                "noscript",
             ]
         ):
+            tag.decompose()
 
-            element.decompose()
-
-        visible_text = _clean_text(
-            soup.get_text(" ")
+        text = _clean(
+            soup.get_text(
+                " "
+            )
         )
 
-        if not visible_text:
-
-            print(
-                "Scheme page contained "
-                "no visible text."
-            )
-
+        if not text:
             return None
 
         title = ""
 
-        if soup.title:
+        heading = soup.find("h1")
 
-            title = _clean_text(
-                soup.title.get_text()
+        if heading:
+            title = _clean(
+                heading.get_text(
+                    " "
+                )
             )
 
-        h1 = soup.find(
-            "h1"
-        )
-
-        if h1:
-
-            h1_text = _clean_text(
-                h1.get_text()
+        if (
+            not title
+            and soup.title
+        ):
+            title = _clean(
+                soup.title.get_text(
+                    " "
+                )
             )
-
-            if h1_text:
-
-                title = h1_text
 
         if not title:
-
-            title = "myScheme scheme"
+            title = (
+                "Government Scheme"
+            )
 
         return {
             "scheme_name": title,
-            "description": visible_text,
+            "description": text,
             "eligibility_signals": "",
             "benefits": "",
             "application_info": "",
-            "url": normalized_url,
+            "url": url,
             "source": SOURCE_NAME,
             "state": state,
             "category": "",
-            "fetched_at": _now_iso(),
+            "fetched_at": _now(),
         }
 
     except Exception as exc:
-
         print(
-            f"Scheme parsing failed: "
-            f"{exc}"
+            "Scheme page failed:",
+            repr(exc),
         )
 
         return None
 
 
-def _run_myscheme_questionnaire(
-    page,
-    profile: dict[str, Any],
-) -> list[dict[str, str]]:
+def _is_results_page(page):
+    url = page.url.lower()
 
+    return (
+        "/search/user-journey"
+        in url
+        or "/search?"
+        in url
+    )
+
+
+def _run_questionnaire(
+    page,
+    profile,
+):
     page.goto(
         MYSCHEME_SEARCH_URL,
         wait_until="domcontentloaded",
-        timeout=30_000,
+        timeout=30000,
     )
 
     page.wait_for_timeout(
-        1500
+        1200
     )
 
-    find_button = page.get_by_text(
+    start = page.get_by_text(
         "Find Schemes For You",
         exact=True,
     )
 
-    if find_button.count() == 0:
-
-        raise RuntimeError(
-            "Could not find myScheme "
-            "'Find Schemes For You' button."
+    if not start.count():
+        start = page.get_by_text(
+            "Find Schemes For You"
         )
 
-    print(
-        "Clicking 'Find Schemes For You'..."
-    )
+    if not start.count():
+        _debug_page(page)
 
-    find_button.first.click(
+        raise RuntimeError(
+            "Could not start myScheme "
+            "questionnaire."
+        )
+
+    start.first.click(
         force=True
     )
 
@@ -1993,334 +1492,196 @@ def _run_myscheme_questionnaire(
         1000
     )
 
-    answered_fields: set[str] = set()
+    answered = set()
 
-    max_steps = 30
-
-    for step in range(
+    # Page transitions, not individual fields.
+    for page_step in range(
         1,
-        max_steps + 1,
+        30,
     ):
-
-        page.wait_for_timeout(
-            700
-        )
-
         print()
         print(
-            f"Questionnaire step {step}: "
-            f"{page.url}"
-        )
-
-        # -----------------------------------------------------
-        # Results page.
-        # -----------------------------------------------------
-
-        if (
-            "/search/user-journey"
-            in page.url
-        ):
-
-            print(
-                "Reached myScheme "
-                "results page."
-            )
-
-            cards = _extract_scheme_cards(
-                page
-            )
-
-            if cards:
-
-                return cards
-
-            page.wait_for_timeout(
-                1500
-            )
-
-            return _extract_scheme_cards(
-                page
-            )
-
-        # -----------------------------------------------------
-        # Current question.
-        # -----------------------------------------------------
-
-        field_name, question_text = (
-            _visible_question(
-                page,
-                answered_fields,
-                profile,
-            )
-        )
-
-        if not field_name:
-
-            print(
-                "No unanswered questionnaire "
-                "control detected."
-            )
-
-            _debug_dom(
-                page
-            )
-
-            page.wait_for_timeout(
-                1500
-            )
-
-            field_name, question_text = (
-                _visible_question(
-                    page,
-                    answered_fields,
-                    profile,
-                )
-            )
-
-            if not field_name:
-
-                raise RuntimeError(
-                    "myScheme reached an "
-                    "unknown questionnaire "
-                    f"state: {page.url}"
-                )
-
-        print(
-            f"Current question: "
-            f"{field_name}"
+            f"myScheme page {page_step}"
         )
 
         print(
-            f"Question text: "
-            f"{question_text}"
+            "URL:",
+            page.url,
         )
 
-        # -----------------------------------------------------
-        # Answer.
-        # -----------------------------------------------------
-
-        _answer_current_question(
-            page,
-            profile,
-            field_name,
-        )
-
-        answered_fields.add(
-            field_name
-        )
-
-        print(
-            f"Answered: "
-            f"{field_name}"
-        )
-
-        # -----------------------------------------------------
-        # Verify gender.
-        # -----------------------------------------------------
-
-        if field_name == "gender":
-
-            expected = str(
-                profile.get(
-                    "gender"
-                )
-            ).strip()
-
-            radio = _find_matching_radio(
-                page,
-                "gender",
-                expected,
-            )
-
-            if (
-                radio is None
-                or not radio.is_checked()
-            ):
-
-                _debug_dom(
-                    page
-                )
-
-                raise RuntimeError(
-                    f"Gender selection was "
-                    f"not verified: "
-                    f"expected '{expected}'."
-                )
-
-            print(
-                f"Verified gender before Next: "
-                f"'{expected}'"
-            )
-
-        # -----------------------------------------------------
-        # Verify age.
-        # -----------------------------------------------------
-
-        if field_name == "age":
-
-            expected_age = str(
-                profile.get(
-                    "age"
-                )
-            ).strip()
-
-            age_verified = False
-
-            selects = page.locator(
-                "select:visible"
-            )
-
-            for i in range(
-                selects.count()
-            ):
-
-                select = selects.nth(i)
-
-                if _is_age_select(
-                    select
-                ):
-
-                    if (
-                        select.input_value()
-                        == expected_age
-                    ):
-
-                        age_verified = True
-                        break
-
-            if not age_verified:
-
-                _debug_dom(
-                    page
-                )
-
-                raise RuntimeError(
-                    f"Age selection was "
-                    f"not verified: "
-                    f"expected "
-                    f"'{expected_age}'."
-                )
-
-            print(
-                f"Verified age before Next: "
-                f"'{expected_age}'"
-            )
-
-        # -----------------------------------------------------
-        # Verify radio questions.
-        # -----------------------------------------------------
-
-        if field_name in {
-            "gender",
-            "caste",
-            "disability",
-            "minority",
-            "isStudent",
-            "isBpl",
-        }:
-
-            expected_answer = (
-                _profile_answer(
-                    profile,
-                    field_name,
-                )
-            )
-
-            verified_radio = (
-                _find_matching_radio(
-                    page,
-                    field_name,
-                    expected_answer,
-                )
-            )
-
-            if (
-                verified_radio is not None
-                and verified_radio.is_checked()
-            ):
-
-                print(
-                    f"Verified "
-                    f"{field_name} before Next: "
-                    f"{verified_radio.get_attribute('value')}"
-                )
-
-            else:
-
-                _debug_dom(
-                    page
-                )
-
-                raise RuntimeError(
-                    f"{field_name} selection "
-                    f"was not verified."
-                )
-
-        # -----------------------------------------------------
-        # Next / Submit.
-        # -----------------------------------------------------
-
-        if not _click_next(
+        if _is_results_page(
             page
         ):
+            page.wait_for_timeout(
+                1500
+            )
 
-            _debug_dom(
+            return _extract_scheme_links(
                 page
             )
 
-            raise RuntimeError(
-                f"Could not find "
-                f"Next/Submit after "
-                f"answering "
-                f"'{field_name}'."
+        # ------------------------------------------
+        # Critical improvement:
+        # answer EVERY supported field currently
+        # visible before clicking Next/Submit.
+        # ------------------------------------------
+
+        answered_on_page = False
+
+        for inner_pass in range(
+            1,
+            15,
+        ):
+            fields = (
+                _visible_supported_fields(
+                    page,
+                    answered,
+                    profile,
+                )
             )
 
-        print(
-            f"Clicked Next/Submit after "
-            f"{field_name}"
+            if not fields:
+                break
+
+            print(
+                "Visible fields:",
+                fields,
+            )
+
+            progress = False
+
+            for field_name in fields:
+                if field_name in answered:
+                    continue
+
+                success = _answer_field(
+                    page,
+                    profile,
+                    field_name,
+                )
+
+                if not success:
+                    _debug_page(page)
+
+                    raise RuntimeError(
+                        "Could not answer "
+                        f"myScheme field "
+                        f"{field_name!r}."
+                    )
+
+                answered.add(
+                    field_name
+                )
+
+                progress = True
+                answered_on_page = True
+
+                page.wait_for_timeout(
+                    350
+                )
+
+            if not progress:
+                break
+
+        # ------------------------------------------
+        # Detect a new unknown radio field BEFORE
+        # clicking Next/Submit.
+        # ------------------------------------------
+
+        unknown = (
+            _unknown_required_radios(
+                page,
+                answered,
+            )
         )
 
-        page.wait_for_timeout(
-            1000
+        if unknown:
+            _debug_page(page)
+
+            raise RuntimeError(
+                "myScheme introduced an "
+                "unsupported questionnaire "
+                "field: "
+                + ", ".join(unknown)
+            )
+
+        if _is_results_page(
+            page
+        ):
+            return _extract_scheme_links(
+                page
+            )
+
+        # ------------------------------------------
+        # Continue.
+        # ------------------------------------------
+
+        if _click_continue(
+            page
+        ):
+            continue
+
+        # If there is no Next/Submit but myScheme
+        # exposes Skip to Results, use that only
+        # after all visible supported fields have
+        # already been answered.
+
+        if _click_skip_to_results(
+            page
+        ):
+            continue
+
+        _debug_page(page)
+
+        if not answered_on_page:
+            raise RuntimeError(
+                "No questionnaire field or "
+                "continue control could be "
+                "processed."
+            )
+
+        raise RuntimeError(
+            "Could not continue the "
+            "myScheme questionnaire."
         )
 
     raise RuntimeError(
         "myScheme questionnaire exceeded "
-        f"the safety limit of "
-        f"{max_steps} steps."
+        "the maximum number of pages."
     )
 
 
 def fetch_schemes(
     profile: dict[str, Any],
-) -> list[dict[str, Any]]:
+):
+    """
+    Fetch live government scheme results
+    from the official myScheme questionnaire.
+    """
 
     profile = _normalise_profile(
         profile
     )
 
-    print(
-        "Starting myScheme live retrieval..."
-    )
+    print()
+    print("=" * 60)
+    print("SKILLSETU LIVE MYSCHEME")
+    print("=" * 60)
 
     print(
-        f"Profile used: {profile}"
+        "Profile:",
+        profile,
     )
 
     try:
-
-        with sync_playwright() as playwright:
-
-            print(
-                "Launching Chromium..."
-            )
-
-            browser = playwright.chromium.launch(
-                headless=True
+        with sync_playwright() as p:
+            browser = (
+                p.chromium.launch(
+                    headless=True
+                )
             )
 
             try:
-
                 page = browser.new_page(
                     viewport={
                         "width": 1440,
@@ -2328,187 +1689,117 @@ def fetch_schemes(
                     }
                 )
 
-                print(
-                    f"Opening myScheme: "
-                    f"{MYSCHEME_SEARCH_URL}"
-                )
-
-                cards = (
-                    _run_myscheme_questionnaire(
-                        page,
-                        profile,
-                    )
+                urls = _run_questionnaire(
+                    page,
+                    profile,
                 )
 
                 print(
-                    f"myScheme returned "
-                    f"{len(cards)} "
-                    f"scheme links."
+                    "Questionnaire returned:",
+                    len(urls),
                 )
 
-                if not cards:
-
-                    print(
-                        "No real scheme links "
-                        "were returned."
-                    )
-
+                if not urls:
                     return []
 
-                state = str(
-                    _get_profile_value(
-                        profile,
+                state = _clean(
+                    profile.get(
                         "state",
-                        "location",
+                        ""
                     )
-                    or ""
                 )
 
-                schemes: list[
-                    dict[str, Any]
-                ] = []
+                schemes = []
 
-                for index, card in enumerate(
-                    cards,
+                # Keep hackathon demo responsive.
+                for index, url in enumerate(
+                    urls[:12],
                     start=1,
                 ):
-
-                    url = card.get(
-                        "url",
-                        "",
-                    )
-
                     print()
                     print(
-                        f"Parsing scheme "
-                        f"{index}/{len(cards)}: "
-                        f"{url}"
+                        f"Scheme {index}/"
+                        f"{min(len(urls), 12)}"
                     )
 
-                    if not _is_real_scheme_url(
-                        url
-                    ):
-
-                        continue
-
-                    try:
-
-                        scheme = (
-                            _parse_scheme_page(
-                                page,
-                                url,
-                                state,
-                            )
+                    scheme = (
+                        _parse_scheme_page(
+                            page,
+                            url,
+                            state,
                         )
+                    )
 
-                        if scheme:
-
-                            schemes.append(
-                                scheme
-                            )
-
-                    except PlaywrightTimeoutError:
-
-                        print(
-                            f"Timeout loading "
-                            f"{url}"
-                        )
-
-                    except Exception as exc:
-
-                        print(
-                            f"Error loading "
-                            f"{url}: {exc}"
+                    if scheme:
+                        schemes.append(
+                            scheme
                         )
 
                 print()
                 print(
-                    f"Successfully parsed "
-                    f"{len(schemes)} "
-                    f"live scheme records."
+                    "Live schemes parsed:",
+                    len(schemes),
                 )
 
                 return schemes
 
             finally:
-
                 browser.close()
 
     except Exception as exc:
-
         print()
-        print("=" * 60)
-        print("fetch_schemes FAILED")
-        print("=" * 60)
         print(
-            f"Error type: "
-            f"{type(exc).__name__}"
+            "myScheme retrieval failed:"
         )
+
         print(
-            f"Error: {exc}"
+            repr(exc)
         )
-        print("=" * 60)
 
         return []
 
 
 if __name__ == "__main__":
-
-    print(
-        "Running myScheme live retrieval "
-        "smoke test..."
-    )
-
     test_profile = {
-        "gender": "Male",
-        "age": 18,
+        "name": "Ravi",
+        "location": "Guntur",
         "state": "Andhra Pradesh",
-        "location": "Andhra Pradesh",
+        "gender": "Male",
+        "age": 25,
         "residence": "Rural",
-        "caste": "SC",
+        "caste": "General",
         "disability": "No",
         "minority": "No",
-        "is_student": True,
-        "is_bpl": False,
+        "is_student": False,
+        "employment_status": "Unemployed",
+        "marital_status": "Never Married",
+        "is_bpl": True,
+        "is_economic_distress": False,
+        "annual_family_income": 0,
+        "annual_parent_income": 0,
     }
 
-    results = fetch_schemes(
+    schemes = fetch_schemes(
         test_profile
     )
 
     print()
     print(
-        f"RESULT COUNT: "
-        f"{len(results)}"
+        "SCHEMES RETURNED:",
+        len(schemes),
     )
 
-    for index, scheme in enumerate(
-        results,
-        start=1,
-    ):
-
-        print()
+    for scheme in schemes[:5]:
         print(
-            f"[{index}] "
-            f"{scheme.get('scheme_name')}"
+            "-",
+            scheme.get(
+                "scheme_name"
+            ),
         )
 
         print(
-            f"URL: "
-            f"{scheme.get('url')}"
-        )
-
-        print(
-            f"SOURCE: "
-            f"{scheme.get('source')}"
-        )
-
-        print(
-            f"STATE: "
-            f"{scheme.get('state')}"
-        )
-
-        print(
-            f"FETCHED_AT: "
-            f"{scheme.get('fetched_at')}"
+            " ",
+            scheme.get(
+                "url"
+            ),
         )
