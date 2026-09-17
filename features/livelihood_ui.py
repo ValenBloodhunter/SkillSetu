@@ -1,5 +1,13 @@
 """
 SkillSetu - Livelihood Worker Streamlit UI
+
+Includes:
+- Livelihood profile
+- Live opportunity matching
+- User-controlled opportunity filtering
+- Live myScheme recommendations
+- Scheme result filtering
+- Telugu / English / Hindi voice assistant
 """
 
 import streamlit as st
@@ -19,6 +27,10 @@ from features.voice import (
 )
 
 
+# ============================================================
+# HELPERS
+# ============================================================
+
 def _split_skills(value):
     if not value:
         return []
@@ -29,6 +41,175 @@ def _split_skills(value):
         if skill.strip()
     ]
 
+
+def _get_match_score(result):
+    """
+    Supports the different score keys used during
+    SkillSetu development.
+    """
+    try:
+        return int(
+            result.get(
+                "score",
+                result.get(
+                    "match_score",
+                    result.get(
+                        "match_percentage",
+                        0,
+                    ),
+                ),
+            )
+            or 0
+        )
+    except (TypeError, ValueError):
+        return 0
+
+
+def _filter_opportunities(
+    jobs,
+    role_keyword="",
+    minimum_match=0,
+    work_mode="All",
+):
+    """
+    Filter AFTER the shared matching engine.
+
+    This is intentional:
+    - live jobs are still fetched normally
+    - matching_engine() still ranks them
+    - user can narrow the displayed results
+    """
+
+    filtered = []
+
+    keyword = str(
+        role_keyword or ""
+    ).strip().lower()
+
+    for result in jobs or []:
+        opportunity = result.get(
+            "opportunity",
+            {},
+        )
+
+        title = str(
+            opportunity.get(
+                "title",
+                "",
+            )
+        ).lower()
+
+        score = _get_match_score(
+            result
+        )
+
+        remote = bool(
+            opportunity.get(
+                "remote",
+                False,
+            )
+        )
+
+        # Job-title filter
+        if keyword:
+            if keyword not in title:
+                continue
+
+        # Match percentage filter
+        if score < minimum_match:
+            continue
+
+        # Work-mode filter
+        if (
+            work_mode == "Remote"
+            and not remote
+        ):
+            continue
+
+        if (
+            work_mode == "On-site"
+            and remote
+        ):
+            continue
+
+        filtered.append(
+            result
+        )
+
+    return filtered
+
+
+def _scheme_search_text(item):
+    """
+    Build searchable text for a scheme result.
+
+    We only filter what live myScheme / RAG already returned.
+    We do NOT invent eligibility.
+    """
+
+    values = [
+        item.get("scheme_name", ""),
+        item.get("text", ""),
+        item.get("state", ""),
+        item.get("category", ""),
+        item.get("source", ""),
+    ]
+
+    return " ".join(
+        str(value)
+        for value in values
+        if value
+    ).lower()
+
+
+def _filter_schemes(
+    retrieved,
+    keyword="",
+    state_filter="All",
+):
+    """
+    Simple transparent filter over live myScheme results.
+
+    This is NOT an eligibility engine.
+    """
+
+    filtered = []
+
+    keyword = str(
+        keyword or ""
+    ).strip().lower()
+
+    for item in retrieved or []:
+        searchable = _scheme_search_text(
+            item
+        )
+
+        if keyword:
+            if keyword not in searchable:
+                continue
+
+        item_state = str(
+            item.get(
+                "state",
+                "",
+            )
+        ).strip()
+
+        if state_filter == "My State":
+            # State filtering is handled in the UI because
+            # we need the active profile there.
+            pass
+
+        filtered.append(
+            item
+        )
+
+    return filtered
+
+
+# ============================================================
+# MAIN UI
+# ============================================================
 
 def render_livelihood_ui():
     st.title("🌾 SkillSetu")
@@ -51,9 +232,9 @@ def render_livelihood_ui():
         ]
     )
 
-    # ==================================================
+    # ========================================================
     # PROFILE
-    # ==================================================
+    # ========================================================
 
     with tabs[0]:
         st.subheader(
@@ -361,6 +542,10 @@ def render_livelihood_ui():
             ] = []
 
             st.session_state[
+                "livelihood_jobs_searched"
+            ] = False
+
+            st.session_state[
                 "livelihood_scheme_result"
             ] = None
 
@@ -459,9 +644,9 @@ def render_livelihood_ui():
                     summary["language"],
                 )
 
-    # ==================================================
+    # ========================================================
     # OPPORTUNITIES
-    # ==================================================
+    # ========================================================
 
     with tabs[1]:
         st.subheader(
@@ -479,9 +664,9 @@ def render_livelihood_ui():
 
         else:
             st.caption(
-                "Live jobs are fetched at runtime "
-                "and ranked using the same shared "
-                "matching engine used by SkillSetu."
+                "Jobs are fetched live and ranked using "
+                "SkillSetu's shared matching engine. "
+                "Use the filters below to narrow the results."
             )
 
             if st.button(
@@ -494,7 +679,9 @@ def render_livelihood_ui():
                     jobs = (
                         get_livelihood_opportunities(
                             profile,
-                            limit=5,
+                            # Fetch more so the user has
+                            # enough results to filter.
+                            limit=20,
                         )
                     )
 
@@ -502,14 +689,101 @@ def render_livelihood_ui():
                         "livelihood_jobs"
                     ] = jobs
 
+                    st.session_state[
+                        "livelihood_jobs_searched"
+                    ] = True
+
             jobs = st.session_state.get(
                 "livelihood_jobs",
                 [],
             )
 
+            searched = st.session_state.get(
+                "livelihood_jobs_searched",
+                False,
+            )
+
             if jobs:
+                st.markdown(
+                    "### 🔎 Filter Opportunities"
+                )
+
+                filter_col1, filter_col2, filter_col3 = (
+                    st.columns(3)
+                )
+
+                with filter_col1:
+                    role_filter = st.text_input(
+                        "Job title contains",
+                        value="",
+                        placeholder=(
+                            "Driver, Analyst, Developer..."
+                        ),
+                        key="livelihood_job_role_filter",
+                    )
+
+                with filter_col2:
+                    minimum_match = st.slider(
+                        "Minimum match %",
+                        min_value=0,
+                        max_value=100,
+                        value=0,
+                        step=5,
+                        key="livelihood_min_match",
+                    )
+
+                with filter_col3:
+                    work_mode = st.selectbox(
+                        "Work mode",
+                        [
+                            "All",
+                            "Remote",
+                            "On-site",
+                        ],
+                        key="livelihood_work_mode_filter",
+                    )
+
+                filtered_jobs = (
+                    _filter_opportunities(
+                        jobs=jobs,
+                        role_keyword=role_filter,
+                        minimum_match=minimum_match,
+                        work_mode=work_mode,
+                    )
+                )
+
+                metric1, metric2 = (
+                    st.columns(2)
+                )
+
+                with metric1:
+                    st.metric(
+                        "Live matches",
+                        len(jobs),
+                    )
+
+                with metric2:
+                    st.metric(
+                        "After filters",
+                        len(filtered_jobs),
+                    )
+
+                if role_filter.strip():
+                    st.caption(
+                        "Filtering job titles for: "
+                        f"{role_filter.strip()}"
+                    )
+
+                if not filtered_jobs:
+                    st.warning(
+                        "No currently fetched live jobs "
+                        "match these filters. Try removing "
+                        "the title filter or lowering the "
+                        "minimum match percentage."
+                    )
+
                 for index, result in enumerate(
-                    jobs,
+                    filtered_jobs,
                     start=1,
                 ):
                     opportunity = result.get(
@@ -538,6 +812,13 @@ def render_livelihood_ui():
                             )
                         )
 
+                        remote = bool(
+                            opportunity.get(
+                                "remote",
+                                False,
+                            )
+                        )
+
                         st.write(
                             f"**Company:** {company}"
                         )
@@ -547,15 +828,17 @@ def render_livelihood_ui():
                             f"{location_value}"
                         )
 
-                        score = result.get(
-                            "score",
-                            result.get(
-                                "match_score",
-                                result.get(
-                                    "match_percentage",
-                                    0,
-                                ),
-                            ),
+                        st.write(
+                            "**Work mode:** "
+                            + (
+                                "Remote"
+                                if remote
+                                else "On-site / location based"
+                            )
+                        )
+
+                        score = _get_match_score(
+                            result
                         )
 
                         st.metric(
@@ -635,17 +918,22 @@ def render_livelihood_ui():
                                 url,
                             )
 
-            elif st.session_state.get(
-                "livelihood_jobs"
-            ) == []:
+            elif searched:
+                st.warning(
+                    "The live job feed returned no "
+                    "matching opportunities for this "
+                    "profile right now."
+                )
+
+            else:
                 st.info(
                     "Click Find Live Opportunities "
                     "to search the live job feed."
                 )
 
-    # ==================================================
+    # ========================================================
     # GOVERNMENT SCHEMES
-    # ==================================================
+    # ========================================================
 
     with tabs[2]:
         st.subheader(
@@ -663,10 +951,9 @@ def render_livelihood_ui():
 
         else:
             st.caption(
-                "SkillSetu searches the live myScheme "
-                "questionnaire, indexes the returned "
-                "official scheme pages, and retrieves "
-                "relevant information using RAG."
+                "SkillSetu searches live myScheme, "
+                "indexes official scheme information, "
+                "and uses RAG to retrieve relevant results."
             )
 
             if st.button(
@@ -682,7 +969,9 @@ def render_livelihood_ui():
                     scheme_result = (
                         get_livelihood_schemes(
                             profile,
-                            limit=5,
+                            # Fetch more candidates so
+                            # filters remain useful.
+                            limit=10,
                         )
                     )
 
@@ -714,8 +1003,8 @@ def render_livelihood_ui():
                     st.warning(error)
 
                 if schemes:
-                    metric1, metric2 = (
-                        st.columns(2)
+                    metric1, metric2, metric3 = (
+                        st.columns(3)
                     )
 
                     with metric1:
@@ -733,17 +1022,178 @@ def render_livelihood_ui():
                             ),
                         )
 
-                if retrieved:
-                    st.success(
-                        "Relevant government schemes found."
+                    with metric3:
+                        ranking_method = (
+                            result.get(
+                                "ranking_method",
+                                "live",
+                            )
+                        )
+
+                        st.metric(
+                            "Recommendations",
+                            len(retrieved),
+                        )
+
+                    st.caption(
+                        "Ranking method: "
+                        f"{ranking_method}"
                     )
+
+                if retrieved:
+                    st.markdown(
+                        "### 🔎 Filter Schemes"
+                    )
+
+                    scheme_col1, scheme_col2 = (
+                        st.columns(2)
+                    )
+
+                    with scheme_col1:
+                        scheme_keyword = (
+                            st.text_input(
+                                "Scheme keyword",
+                                value="",
+                                placeholder=(
+                                    "farmer, agriculture, "
+                                    "training, employment..."
+                                ),
+                                key=(
+                                    "livelihood_scheme_keyword"
+                                ),
+                            )
+                        )
+
+                    with scheme_col2:
+                        scheme_scope = (
+                            st.selectbox(
+                                "Scheme location",
+                                [
+                                    "All",
+                                    "My State",
+                                    "Central / National",
+                                ],
+                                key=(
+                                    "livelihood_scheme_scope"
+                                ),
+                            )
+                        )
+
+                    filtered_schemes = (
+                        _filter_schemes(
+                            retrieved,
+                            keyword=scheme_keyword,
+                            state_filter=(
+                                scheme_scope
+                            ),
+                        )
+                    )
+
+                    # ----------------------------------------
+                    # STATE FILTER
+                    # ----------------------------------------
+
+                    if (
+                        scheme_scope
+                        == "My State"
+                    ):
+                        profile_state = str(
+                            getattr(
+                                profile,
+                                "state",
+                                "",
+                            )
+                        ).strip().lower()
+
+                        state_filtered = []
+
+                        for item in filtered_schemes:
+                            item_state = str(
+                                item.get(
+                                    "state",
+                                    "",
+                                )
+                            ).strip().lower()
+
+                            # Keep blank-state schemes because
+                            # many central schemes do not expose
+                            # state metadata in every RAG chunk.
+                            if (
+                                not item_state
+                                or not profile_state
+                                or profile_state
+                                in item_state
+                                or item_state
+                                in profile_state
+                            ):
+                                state_filtered.append(
+                                    item
+                                )
+
+                        filtered_schemes = (
+                            state_filtered
+                        )
+
+                    elif (
+                        scheme_scope
+                        == "Central / National"
+                    ):
+                        national_terms = {
+                            "",
+                            "all india",
+                            "india",
+                            "central",
+                            "national",
+                        }
+
+                        national_filtered = []
+
+                        for item in filtered_schemes:
+                            item_state = str(
+                                item.get(
+                                    "state",
+                                    "",
+                                )
+                            ).strip().lower()
+
+                            if (
+                                item_state
+                                in national_terms
+                            ):
+                                national_filtered.append(
+                                    item
+                                )
+
+                        filtered_schemes = (
+                            national_filtered
+                        )
+
+                    st.caption(
+                        f"Showing {len(filtered_schemes)} "
+                        f"of {len(retrieved)} retrieved "
+                        "scheme recommendations."
+                    )
+
+                    st.info(
+                        "These are profile-relevant results "
+                        "from live myScheme/RAG. Final "
+                        "eligibility should be verified on "
+                        "the official scheme page."
+                    )
+
+                    if not filtered_schemes:
+                        st.warning(
+                            "No retrieved schemes match "
+                            "the current filters. Try "
+                            "clearing the keyword or "
+                            "selecting All."
+                        )
 
                     seen_urls = set()
 
-                    for index, item in enumerate(
-                        retrieved,
-                        start=1,
-                    ):
+                    display_index = 0
+
+                    for item in filtered_schemes:
                         url = item.get(
                             "url",
                             "",
@@ -756,7 +1206,11 @@ def render_livelihood_ui():
                             continue
 
                         if url:
-                            seen_urls.add(url)
+                            seen_urls.add(
+                                url
+                            )
+
+                        display_index += 1
 
                         scheme_name = item.get(
                             "scheme_name",
@@ -767,7 +1221,16 @@ def render_livelihood_ui():
                             border=True
                         ):
                             st.markdown(
-                                f"### {scheme_name}"
+                                f"### {display_index}. "
+                                f"{scheme_name}"
+                            )
+
+                            # We deliberately say
+                            # "Profile relevance", not
+                            # "Eligible".
+                            st.write(
+                                "**Profile relevance:** "
+                                "Potential match"
                             )
 
                             text = item.get(
@@ -787,15 +1250,37 @@ def render_livelihood_ui():
 
                             if state_value:
                                 st.write(
-                                    "**State:** "
+                                    "**Scheme location:** "
                                     f"{state_value}"
                                 )
 
+                            category = item.get(
+                                "category",
+                                "",
+                            )
+
+                            if category:
+                                st.write(
+                                    "**Category:** "
+                                    f"{category}"
+                                )
+
+                            source = item.get(
+                                "source",
+                                "myScheme",
+                            )
+
+                            fetched_at = item.get(
+                                "fetched_at",
+                                "",
+                            )
+
                             st.caption(
-                                "Source: "
-                                + item.get(
-                                    "source",
-                                    "myScheme",
+                                f"Source: {source}"
+                                + (
+                                    f" • Fetched: {fetched_at}"
+                                    if fetched_at
+                                    else ""
                                 )
                             )
 
@@ -804,6 +1289,12 @@ def render_livelihood_ui():
                                     "Open Official Scheme",
                                     url,
                                 )
+
+                    if display_index == 0:
+                        st.warning(
+                            "No unique schemes remain "
+                            "after filtering."
+                        )
 
                 elif schemes:
                     st.info(
@@ -828,15 +1319,18 @@ def render_livelihood_ui():
         st.caption(
             "Architecture proof: Livelihood Profile → "
             "Live myScheme → ChromaDB → RAG. "
-            "Jobs use the shared matching_engine()."
+            "Jobs use the shared matching_engine(). "
+            "Filters are applied after live retrieval."
         )
 
-    # ==================================================
+    # ========================================================
     # VOICE ASSISTANT
-    # ==================================================
+    # ========================================================
 
     with tabs[3]:
-        st.subheader("🎙️ Voice Assistant")
+        st.subheader(
+            "🎙️ Voice Assistant"
+        )
 
         st.caption(
             "Speak in Telugu, English, or Hindi. "
@@ -863,18 +1357,22 @@ def render_livelihood_ui():
             )
 
             st.info(
-                f"Preferred response language: "
+                "Preferred response language: "
                 f"{preferred_language}"
             )
 
-            st.markdown("#### 🎤 Speak to SkillSetu")
+            st.markdown(
+                "#### 🎤 Speak to SkillSetu"
+            )
 
             recorded_audio = st.audio_input(
                 "Record your question"
             )
 
             if recorded_audio is not None:
-                st.audio(recorded_audio)
+                st.audio(
+                    recorded_audio
+                )
 
                 if st.button(
                     "Ask with Voice",
@@ -883,7 +1381,8 @@ def render_livelihood_ui():
                 ):
                     try:
                         with st.spinner(
-                            "Listening and preparing your answer..."
+                            "Listening and preparing "
+                            "your answer..."
                         ):
                             audio_bytes = (
                                 recorded_audio.getvalue()
@@ -922,7 +1421,9 @@ def render_livelihood_ui():
             if voice_result:
                 st.divider()
 
-                st.markdown("#### 📝 What you said")
+                st.markdown(
+                    "#### 📝 What you said"
+                )
 
                 transcript = voice_result.get(
                     "transcript",
@@ -934,9 +1435,11 @@ def render_livelihood_ui():
                     or "No transcript was returned."
                 )
 
-                detected_language = voice_result.get(
-                    "detected_language",
-                    "",
+                detected_language = (
+                    voice_result.get(
+                        "detected_language",
+                        "",
+                    )
                 )
 
                 if detected_language:
@@ -945,18 +1448,26 @@ def render_livelihood_ui():
                         f"{detected_language}"
                     )
 
-                st.markdown("#### 🤖 SkillSetu response")
+                st.markdown(
+                    "#### 🤖 SkillSetu response"
+                )
 
-                response_text = voice_result.get(
-                    "response_text",
-                    "",
+                response_text = (
+                    voice_result.get(
+                        "response_text",
+                        "",
+                    )
                 )
 
                 if response_text:
-                    st.write(response_text)
+                    st.write(
+                        response_text
+                    )
 
-                response_audio = voice_result.get(
-                    "audio_bytes"
+                response_audio = (
+                    voice_result.get(
+                        "audio_bytes"
+                    )
                 )
 
                 if response_audio:
@@ -967,19 +1478,25 @@ def render_livelihood_ui():
 
             st.divider()
 
-            st.markdown("#### ⌨️ Text fallback")
+            st.markdown(
+                "#### ⌨️ Text fallback"
+            )
 
             st.caption(
-                "If microphone permission or speech recognition "
-                "does not work during the demo, type the same "
-                "question here."
+                "If microphone permission or speech "
+                "recognition does not work during the "
+                "demo, type the same question here."
             )
 
             typed_question = st.text_input(
-                "Ask about jobs, skills, or government schemes",
-                key="livelihood_voice_text_question",
+                "Ask about jobs, skills, or "
+                "government schemes",
+                key=(
+                    "livelihood_voice_text_question"
+                ),
                 placeholder=(
-                    "Example: నాకు ఉద్యోగాలు ఏమైనా ఉన్నాయా?"
+                    "Example: నాకు ఉద్యోగాలు "
+                    "ఏమైనా ఉన్నాయా?"
                 ),
             )
 
@@ -1035,7 +1552,9 @@ def render_livelihood_ui():
                             st.session_state[
                                 "livelihood_text_voice_result"
                             ] = {
-                                "question": typed_question,
+                                "question": (
+                                    typed_question
+                                ),
                                 "response_text": (
                                     localized_response
                                 ),
@@ -1046,7 +1565,8 @@ def render_livelihood_ui():
 
                     except Exception as exc:
                         st.error(
-                            "Could not prepare the response."
+                            "Could not prepare "
+                            "the response."
                         )
 
                         st.caption(
@@ -1058,7 +1578,9 @@ def render_livelihood_ui():
             )
 
             if text_result:
-                st.markdown("#### 🤖 SkillSetu response")
+                st.markdown(
+                    "#### 🤖 SkillSetu response"
+                )
 
                 st.write(
                     text_result.get(
@@ -1067,8 +1589,10 @@ def render_livelihood_ui():
                     )
                 )
 
-                text_audio = text_result.get(
-                    "audio_bytes"
+                text_audio = (
+                    text_result.get(
+                        "audio_bytes"
+                    )
                 )
 
                 if text_audio:
@@ -1080,8 +1604,8 @@ def render_livelihood_ui():
             st.divider()
 
             st.caption(
-                "Voice pipeline: Microphone → Sarvam STT → "
-                "SkillSetu livelihood guidance → Sarvam "
-                "translation → Sarvam TTS."
+                "Voice pipeline: Microphone → "
+                "Sarvam STT → SkillSetu livelihood "
+                "guidance → Sarvam translation → "
+                "Sarvam TTS."
             )
-
