@@ -1,5 +1,11 @@
 import streamlit as st
 
+from features.livelihood import (
+    create_livelihood_profile,
+    get_livelihood_opportunities,
+    get_livelihood_summary,
+)
+
 from features.student import (
     create_student_profile,
     get_skill_assessment_questions,
@@ -28,6 +34,21 @@ st.set_page_config(
     page_title="SkillSetu - Student Career Assistant",
     page_icon="🎓",
     layout="wide",
+)
+
+# ============================================================
+# PERSONA SELECTION
+# ============================================================
+
+if "persona" not in st.session_state:
+    st.session_state.persona = "Student"
+
+st.sidebar.divider()
+st.sidebar.subheader("Choose Experience")
+
+st.session_state.persona = st.sidebar.radio(
+    "I am a:",
+    ["Student", "Livelihood Worker"],
 )
 
 
