@@ -1,14 +1,17 @@
 """
-SkillSetu - Livelihood Worker Streamlit UI
+SkillSetu - Livelihood Worker UI
 
-Includes:
+Features:
 - Livelihood profile
-- Live opportunity matching
-- User-controlled opportunity filtering
-- Live myScheme recommendations
-- Scheme result filtering
-- Telugu / English / Hindi voice assistant
+- Live job opportunities
+- Target-role filtering
+- Live government schemes from myScheme
+- Profile-fit + RAG scheme recommendations
+- All live schemes view
+- Sarvam AI voice assistant
 """
+
+import re
 
 import streamlit as st
 
@@ -20,10 +23,7 @@ from features.livelihood import (
 )
 
 from features.voice import (
-    build_livelihood_voice_response,
     process_voice_turn,
-    translate_text,
-    text_to_speech,
 )
 
 
@@ -32,173 +32,328 @@ from features.voice import (
 # ============================================================
 
 def _split_skills(value):
+    """
+    Convert comma-separated skills into a clean list.
+    """
+
     if not value:
         return []
 
     return [
         skill.strip()
-        for skill in value.split(",")
+        for skill in str(value).split(",")
         if skill.strip()
     ]
 
 
-def _get_match_score(result):
-    """
-    Supports the different score keys used during
-    SkillSetu development.
-    """
-    try:
-        return int(
-            result.get(
-                "score",
-                result.get(
-                    "match_score",
-                    result.get(
-                        "match_percentage",
-                        0,
-                    ),
-                ),
-            )
-            or 0
-        )
-    except (TypeError, ValueError):
-        return 0
+def _normalize(value):
+    return " ".join(
+        str(value or "")
+        .lower()
+        .strip()
+        .split()
+    )
 
 
-def _filter_opportunities(
-    jobs,
-    role_keyword="",
-    minimum_match=0,
-    work_mode="All",
+def _get_profile_value(
+    profile,
+    key,
+    default="",
 ):
     """
-    Filter AFTER the shared matching engine.
-
-    This is intentional:
-    - live jobs are still fetched normally
-    - matching_engine() still ranks them
-    - user can narrow the displayed results
+    Supports both dataclass/object profiles
+    and dictionary profiles.
     """
+
+    if profile is None:
+        return default
+
+    if isinstance(profile, dict):
+        return profile.get(
+            key,
+            default,
+        )
+
+    return getattr(
+        profile,
+        key,
+        default,
+    )
+
+
+def _get_score(item):
+    """
+    Safely retrieve a job match score.
+    """
+
+    try:
+        return float(
+            item.get(
+                "score",
+                0,
+            )
+        )
+    except Exception:
+        return 0.0
+
+
+# ============================================================
+# TARGET ROLE FAMILIES
+# ============================================================
+
+ROLE_FAMILIES = {
+    "driver": [
+        "driver",
+        "delivery driver",
+        "truck driver",
+        "van driver",
+        "cab driver",
+        "taxi driver",
+        "chauffeur",
+        "courier driver",
+    ],
+
+    "farmer": [
+        "farmer",
+        "farm worker",
+        "agriculture worker",
+        "agricultural worker",
+    ],
+
+    "data analyst": [
+        "data analyst",
+        "business analyst",
+        "reporting analyst",
+        "analytics analyst",
+        "bi analyst",
+    ],
+
+    "software developer": [
+        "software developer",
+        "software engineer",
+        "application developer",
+        "programmer",
+    ],
+
+    "web developer": [
+        "web developer",
+        "frontend developer",
+        "front end developer",
+        "backend developer",
+        "back end developer",
+        "full stack developer",
+        "full-stack developer",
+    ],
+
+    "electrician": [
+        "electrician",
+        "electrical technician",
+        "electrical worker",
+    ],
+
+    "mechanic": [
+        "mechanic",
+        "automobile mechanic",
+        "automotive mechanic",
+        "service technician",
+    ],
+
+    "sales": [
+        "sales executive",
+        "sales representative",
+        "sales associate",
+        "sales officer",
+    ],
+
+    "accountant": [
+        "accountant",
+        "accounts executive",
+        "accounts assistant",
+        "bookkeeper",
+    ],
+
+    "teacher": [
+        "teacher",
+        "school teacher",
+        "tutor",
+        "instructor",
+    ],
+}
+
+
+def _role_terms(target_role):
+    target = _normalize(
+        target_role
+    )
+
+    if not target:
+        return []
+
+    if target in ROLE_FAMILIES:
+        return ROLE_FAMILIES[
+            target
+        ]
+
+    # Check whether entered role contains
+    # one of our known role families.
+    for family, terms in (
+        ROLE_FAMILIES.items()
+    ):
+        if (
+            family in target
+            or target in family
+        ):
+            return terms
+
+    return [target]
+
+
+def _phrase_in_title(
+    title,
+    phrase,
+):
+    title = _normalize(
+        title
+    )
+
+    phrase = _normalize(
+        phrase
+    )
+
+    if not title or not phrase:
+        return False
+
+    pattern = (
+        r"\b"
+        + re.escape(
+            phrase
+        )
+        + r"\b"
+    )
+
+    return bool(
+        re.search(
+            pattern,
+            title,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _is_target_role_job(
+    item,
+    target_role,
+):
+    """
+    IMPORTANT:
+
+    Direct target-role recommendations are based
+    on the JOB TITLE.
+
+    We deliberately do not use description text here,
+    because a Data Scientist description could contain
+    a word such as "driving" and incorrectly appear as
+    a Driver recommendation.
+    """
+
+    opportunity = item.get(
+        "opportunity",
+        {},
+    )
+
+    title = opportunity.get(
+        "title",
+        "",
+    )
+
+    terms = _role_terms(
+        target_role
+    )
+
+    if not terms:
+        return True
+
+    return any(
+        _phrase_in_title(
+            title,
+            term,
+        )
+        for term in terms
+    )
+
+
+# ============================================================
+# JOB FILTERS
+# ============================================================
+
+def _filter_jobs(
+    jobs,
+    keyword="",
+    minimum_score=0,
+    work_mode="All",
+):
+    keyword = _normalize(
+        keyword
+    )
 
     filtered = []
 
-    keyword = str(
-        role_keyword or ""
-    ).strip().lower()
-
-    for result in jobs or []:
-        opportunity = result.get(
+    for item in jobs:
+        opportunity = item.get(
             "opportunity",
             {},
         )
 
-        title = str(
-            opportunity.get(
-                "title",
-                "",
-            )
-        ).lower()
-
-        score = _get_match_score(
-            result
-        )
-
-        remote = bool(
-            opportunity.get(
-                "remote",
-                False,
-            )
-        )
-
-        # Job-title filter
-        if keyword:
-            if keyword not in title:
-                continue
-
-        # Match percentage filter
-        if score < minimum_match:
-            continue
-
-        # Work-mode filter
-        if (
-            work_mode == "Remote"
-            and not remote
-        ):
-            continue
-
-        if (
-            work_mode == "On-site"
-            and remote
-        ):
-            continue
-
-        filtered.append(
-            result
-        )
-
-    return filtered
-
-
-def _scheme_search_text(item):
-    """
-    Build searchable text for a scheme result.
-
-    We only filter what live myScheme / RAG already returned.
-    We do NOT invent eligibility.
-    """
-
-    values = [
-        item.get("scheme_name", ""),
-        item.get("text", ""),
-        item.get("state", ""),
-        item.get("category", ""),
-        item.get("source", ""),
-    ]
-
-    return " ".join(
-        str(value)
-        for value in values
-        if value
-    ).lower()
-
-
-def _filter_schemes(
-    retrieved,
-    keyword="",
-    state_filter="All",
-):
-    """
-    Simple transparent filter over live myScheme results.
-
-    This is NOT an eligibility engine.
-    """
-
-    filtered = []
-
-    keyword = str(
-        keyword or ""
-    ).strip().lower()
-
-    for item in retrieved or []:
-        searchable = _scheme_search_text(
+        score = _get_score(
             item
         )
 
+        if score < minimum_score:
+            continue
+
         if keyword:
+            searchable = _normalize(
+                " ".join(
+                    [
+                        opportunity.get(
+                            "title",
+                            "",
+                        ),
+                        opportunity.get(
+                            "company",
+                            "",
+                        ),
+                        opportunity.get(
+                            "location",
+                            "",
+                        ),
+                        " ".join(
+                            opportunity.get(
+                                "tags",
+                                [],
+                            )
+                            or []
+                        ),
+                    ]
+                )
+            )
+
             if keyword not in searchable:
                 continue
 
-        item_state = str(
-            item.get(
-                "state",
-                "",
-            )
-        ).strip()
+        if work_mode == "Remote":
+            if not opportunity.get(
+                "remote",
+                False,
+            ):
+                continue
 
-        if state_filter == "My State":
-            # State filtering is handled in the UI because
-            # we need the active profile there.
-            pass
+        elif work_mode == "On-site":
+            if opportunity.get(
+                "remote",
+                False,
+            ):
+                continue
 
         filtered.append(
             item
@@ -208,19 +363,344 @@ def _filter_schemes(
 
 
 # ============================================================
-# MAIN UI
+# JOB CARD
+# ============================================================
+
+def _render_job_card(
+    item,
+    index,
+    key_prefix,
+):
+    opportunity = item.get(
+        "opportunity",
+        {},
+    )
+
+    title = opportunity.get(
+        "title",
+        "Opportunity",
+    )
+
+    company = opportunity.get(
+        "company",
+        "Company not specified",
+    )
+
+    location = opportunity.get(
+        "location",
+        "Location not specified",
+    )
+
+    score = _get_score(
+        item
+    )
+
+    matched_skills = item.get(
+        "matched_skills",
+        [],
+    )
+
+    missing_skills = item.get(
+        "missing_skills",
+        [],
+    )
+
+    reasons = item.get(
+        "reasons",
+        [],
+    )
+
+    remote = opportunity.get(
+        "remote",
+        False,
+    )
+
+    source = opportunity.get(
+        "source",
+        "Live API",
+    )
+
+    fetched_at = opportunity.get(
+        "fetched_at",
+        "",
+    )
+
+    url = opportunity.get(
+        "url",
+        "",
+    )
+
+    description = opportunity.get(
+        "description",
+        "",
+    )
+
+    with st.container(
+        border=True
+    ):
+        st.markdown(
+            f"### {index}. {title}"
+        )
+
+        st.write(
+            f"**Company:** {company}"
+        )
+
+        st.write(
+            f"**Location:** {location}"
+        )
+
+        st.write(
+            "**Work mode:** "
+            + (
+                "Remote"
+                if remote
+                else "On-site / Not specified"
+            )
+        )
+
+        st.metric(
+            "SkillSetu Match",
+            f"{score:.0f}%",
+        )
+
+        if matched_skills:
+            st.write(
+                "**Matched skills:** "
+                + ", ".join(
+                    matched_skills
+                )
+            )
+
+        if missing_skills:
+            st.write(
+                "**Potential skill gaps:** "
+                + ", ".join(
+                    missing_skills[:8]
+                )
+            )
+
+        if reasons:
+            with st.expander(
+                "Why this match?"
+            ):
+                for reason in reasons:
+                    st.write(
+                        f"• {reason}"
+                    )
+
+        if description:
+            with st.expander(
+                "Job description"
+            ):
+                st.write(
+                    description[:1800]
+                )
+
+        st.caption(
+            f"Source: {source}"
+            + (
+                f" • Fetched: {fetched_at}"
+                if fetched_at
+                else ""
+            )
+        )
+
+        if url:
+            st.link_button(
+                "Open Live Job",
+                url,
+                key=(
+                    f"{key_prefix}_"
+                    f"{index}"
+                ),
+            )
+
+
+# ============================================================
+# SCHEME CARD
+# ============================================================
+
+def _render_scheme_card(
+    item,
+    index,
+    key_prefix,
+    detailed=True,
+):
+    name = item.get(
+        "scheme_name",
+        "Government Scheme",
+    )
+
+    fit_score = item.get(
+        "fit_score",
+        0,
+    )
+
+    combined_score = item.get(
+        "combined_score",
+        fit_score,
+    )
+
+    fit_label = item.get(
+        "fit_label",
+        "Possible fit",
+    )
+
+    reasons = item.get(
+        "fit_reasons",
+        [],
+    )
+
+    warnings = item.get(
+        "fit_warnings",
+        [],
+    )
+
+    text = item.get(
+        "text",
+        "",
+    )
+
+    state = item.get(
+        "state",
+        "",
+    )
+
+    category = item.get(
+        "category",
+        "",
+    )
+
+    source = item.get(
+        "source",
+        "myScheme",
+    )
+
+    fetched_at = item.get(
+        "fetched_at",
+        "",
+    )
+
+    url = item.get(
+        "url",
+        "",
+    )
+
+    with st.container(
+        border=True
+    ):
+        st.markdown(
+            f"### {index}. {name}"
+        )
+
+        col1, col2 = st.columns(
+            [1, 2]
+        )
+
+        with col1:
+            st.metric(
+                "Profile Fit",
+                f"{fit_score}%",
+            )
+
+        with col2:
+            if fit_label == "Strong fit":
+                st.success(
+                    "🟢 Strong fit"
+                )
+
+            elif fit_label == "Possible fit":
+                st.info(
+                    "🟡 Possible fit"
+                )
+
+            else:
+                st.warning(
+                    "⚪ Weak fit"
+                )
+
+        if (
+            combined_score
+            != fit_score
+        ):
+            st.caption(
+                "Combined profile + RAG score: "
+                f"{combined_score}"
+            )
+
+        if text:
+            if detailed:
+                st.write(
+                    text[:1400]
+                )
+            else:
+                st.write(
+                    text[:550]
+                )
+
+        if detailed and reasons:
+            st.markdown(
+                "**Why this may match your profile:**"
+            )
+
+            for reason in reasons:
+                st.write(
+                    f"✓ {reason}"
+                )
+
+        if detailed and warnings:
+            with st.expander(
+                "⚠️ Things to verify"
+            ):
+                for warning in warnings:
+                    st.write(
+                        f"• {warning}"
+                    )
+
+        if state:
+            st.write(
+                f"**State:** {state}"
+            )
+
+        if category:
+            st.write(
+                f"**Category:** {category}"
+            )
+
+        st.caption(
+            f"Source: {source}"
+            + (
+                f" • Fetched: {fetched_at}"
+                if fetched_at
+                else ""
+            )
+        )
+
+        if url:
+            st.link_button(
+                "Open Official myScheme Page",
+                url,
+                key=(
+                    f"{key_prefix}_"
+                    f"{index}"
+                ),
+            )
+
+
+# ============================================================
+# MAIN LIVELIHOOD UI
 # ============================================================
 
 def render_livelihood_ui():
-    st.title("🌾 SkillSetu")
-
-    st.subheader(
-        "Livelihood & Rural Opportunity Assistant"
+    st.title(
+        "🌾 SkillSetu Livelihood Assistant"
     )
 
-    st.caption(
-        "Live opportunities, government schemes "
-        "and livelihood guidance from one shared engine."
+    st.write(
+        "Discover live opportunities, government "
+        "schemes and guidance using one shared "
+        "SkillSetu profile."
     )
 
     tabs = st.tabs(
@@ -233,266 +713,573 @@ def render_livelihood_ui():
     )
 
     # ========================================================
-    # PROFILE
+    # TAB 1 - PROFILE
     # ========================================================
 
     with tabs[0]:
         st.subheader(
-            "Create your livelihood profile"
+            "👤 Build Your Profile"
         )
 
-        st.info(
-            "These details help SkillSetu search "
-            "for relevant jobs and government schemes."
+        st.caption(
+            "Your profile is used by the same "
+            "SkillSetu matching and recommendation "
+            "pipeline."
+        )
+
+        existing = st.session_state.get(
+            "livelihood_profile"
         )
 
         with st.form(
             "livelihood_profile_form"
         ):
+            name = st.text_input(
+                "Name",
+                value=_get_profile_value(
+                    existing,
+                    "name",
+                    "",
+                ),
+            )
+
             col1, col2 = st.columns(2)
 
             with col1:
-                name = st.text_input(
-                    "Name",
-                    value="Ravi",
+                location = st.text_input(
+                    "City / District",
+                    value=_get_profile_value(
+                        existing,
+                        "location",
+                        "",
+                    ),
+                    placeholder="Guntur",
                 )
 
-                location = st.text_input(
-                    "Location / District",
-                    value="Guntur",
+            with col2:
+                state_options = [
+                    "Andhra Pradesh",
+                    "Telangana",
+                    "Tamil Nadu",
+                    "Karnataka",
+                    "Kerala",
+                    "Maharashtra",
+                    "Odisha",
+                    "Other",
+                ]
+
+                existing_state = (
+                    _get_profile_value(
+                        existing,
+                        "state",
+                        "Andhra Pradesh",
+                    )
                 )
+
+                state_index = 0
+
+                if (
+                    existing_state
+                    in state_options
+                ):
+                    state_index = (
+                        state_options.index(
+                            existing_state
+                        )
+                    )
 
                 state = st.selectbox(
                     "State",
-                    [
-                        "Andhra Pradesh",
-                        "Arunachal Pradesh",
-                        "Assam",
-                        "Bihar",
-                        "Chhattisgarh",
-                        "Goa",
-                        "Gujarat",
-                        "Haryana",
-                        "Himachal Pradesh",
-                        "Jharkhand",
-                        "Karnataka",
-                        "Kerala",
-                        "Madhya Pradesh",
-                        "Maharashtra",
-                        "Manipur",
-                        "Meghalaya",
-                        "Mizoram",
-                        "Nagaland",
-                        "Odisha",
-                        "Punjab",
-                        "Rajasthan",
-                        "Sikkim",
-                        "Tamil Nadu",
-                        "Telangana",
-                        "Tripura",
-                        "Uttar Pradesh",
-                        "Uttarakhand",
-                        "West Bengal",
-                        "Delhi",
-                        "Jammu and Kashmir",
-                        "Ladakh",
-                        "Puducherry",
-                    ],
+                    state_options,
+                    index=state_index,
                 )
 
+            col1, col2, col3 = (
+                st.columns(3)
+            )
+
+            with col1:
                 age = st.number_input(
                     "Age",
-                    min_value=1,
-                    max_value=115,
-                    value=25,
-                    step=1,
-                )
-
-                gender = st.selectbox(
-                    "Gender",
-                    [
-                        "Male",
-                        "Female",
-                        "Transgender",
-                    ],
-                )
-
-                residence = st.selectbox(
-                    "Area of residence",
-                    [
-                        "Rural",
-                        "Urban",
-                    ],
-                )
-
-                education = st.selectbox(
-                    "Education",
-                    [
-                        "No formal education",
-                        "10th",
-                        "12th",
-                        "Diploma",
-                        "Graduate",
-                        "Other",
-                    ],
-                    index=2,
-                )
-
-                occupation = st.text_input(
-                    "Current occupation",
-                    value="Farmer",
-                )
-
-                skills_text = st.text_input(
-                    "Skills",
-                    value=(
-                        "Driving, Farming, Smartphone"
-                    ),
-                    help=(
-                        "Separate multiple skills "
-                        "with commas."
+                    min_value=14,
+                    max_value=100,
+                    value=int(
+                        _get_profile_value(
+                            existing,
+                            "age",
+                            25,
+                        )
                     ),
                 )
 
             with col2:
-                target_role = st.text_input(
-                    "Target role",
-                    value="Driver",
+                gender_options = [
+                    "Male",
+                    "Female",
+                    "Other",
+                ]
+
+                existing_gender = (
+                    _get_profile_value(
+                        existing,
+                        "gender",
+                        "Male",
+                    )
                 )
+
+                gender_index = 0
+
+                if (
+                    existing_gender
+                    in gender_options
+                ):
+                    gender_index = (
+                        gender_options.index(
+                            existing_gender
+                        )
+                    )
+
+                gender = st.selectbox(
+                    "Gender",
+                    gender_options,
+                    index=gender_index,
+                )
+
+            with col3:
+                residence_options = [
+                    "Rural",
+                    "Urban",
+                ]
+
+                existing_residence = (
+                    _get_profile_value(
+                        existing,
+                        "residence",
+                        "Rural",
+                    )
+                )
+
+                residence_index = 0
+
+                if (
+                    existing_residence
+                    in residence_options
+                ):
+                    residence_index = (
+                        residence_options.index(
+                            existing_residence
+                        )
+                    )
+
+                residence = st.selectbox(
+                    "Residence",
+                    residence_options,
+                    index=residence_index,
+                )
+
+            education = st.text_input(
+                "Education",
+                value=_get_profile_value(
+                    existing,
+                    "education",
+                    "",
+                ),
+                placeholder="12th Pass",
+            )
+
+            occupation = st.text_input(
+                "Current Occupation",
+                value=_get_profile_value(
+                    existing,
+                    "occupation",
+                    "",
+                ),
+                placeholder="Farmer",
+            )
+
+            skills_value = ", ".join(
+                _get_profile_value(
+                    existing,
+                    "skills",
+                    [],
+                )
+                or []
+            )
+
+            skills_text = st.text_input(
+                "Skills",
+                value=skills_value,
+                placeholder=(
+                    "Driving, Farming, Smartphone"
+                ),
+                help=(
+                    "Enter skills separated by commas."
+                ),
+            )
+
+            target_role = st.text_input(
+                "Target Role",
+                value=_get_profile_value(
+                    existing,
+                    "target_role",
+                    "",
+                ),
+                placeholder="Driver",
+            )
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                experience_options = [
+                    "Fresher",
+                    "0-1 years",
+                    "1-3 years",
+                    "3-5 years",
+                    "5+ years",
+                ]
+
+                existing_experience = (
+                    _get_profile_value(
+                        existing,
+                        "experience",
+                        "Fresher",
+                    )
+                )
+
+                experience_index = 0
+
+                if (
+                    existing_experience
+                    in experience_options
+                ):
+                    experience_index = (
+                        experience_options.index(
+                            existing_experience
+                        )
+                    )
 
                 experience = st.selectbox(
                     "Experience",
-                    [
-                        "fresher",
-                        "beginner",
-                        "1-3 years",
-                        "3+ years",
-                    ],
-                    index=2,
+                    experience_options,
+                    index=experience_index,
                 )
 
-                work_preference = st.selectbox(
-                    "Work preference",
-                    [
-                        "local",
-                        "remote",
-                        "Any",
-                    ],
+            with col2:
+                preference_options = [
+                    "local",
+                    "remote",
+                    "any",
+                ]
+
+                existing_preference = (
+                    _normalize(
+                        _get_profile_value(
+                            existing,
+                            "work_preference",
+                            "local",
+                        )
+                    )
                 )
 
-                language = st.selectbox(
-                    "Preferred language",
-                    [
-                        "Telugu",
-                        "English",
-                        "Hindi",
-                    ],
+                preference_index = 0
+
+                if (
+                    existing_preference
+                    in preference_options
+                ):
+                    preference_index = (
+                        preference_options.index(
+                            existing_preference
+                        )
+                    )
+
+                work_preference = (
+                    st.selectbox(
+                        "Work Preference",
+                        preference_options,
+                        index=preference_index,
+                    )
                 )
+
+            language_options = [
+                "Telugu",
+                "English",
+                "Hindi",
+            ]
+
+            existing_language = (
+                _get_profile_value(
+                    existing,
+                    "language",
+                    "Telugu",
+                )
+            )
+
+            language_index = 0
+
+            if (
+                existing_language
+                in language_options
+            ):
+                language_index = (
+                    language_options.index(
+                        existing_language
+                    )
+                )
+
+            language = st.selectbox(
+                "Preferred Language",
+                language_options,
+                index=language_index,
+            )
+
+            st.markdown(
+                "### Government Scheme Profile"
+            )
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                caste_options = [
+                    "General",
+                    "OBC",
+                    "SC",
+                    "ST",
+                    "Other",
+                ]
+
+                existing_caste = (
+                    _get_profile_value(
+                        existing,
+                        "caste",
+                        "General",
+                    )
+                )
+
+                caste_index = 0
+
+                if (
+                    existing_caste
+                    in caste_options
+                ):
+                    caste_index = (
+                        caste_options.index(
+                            existing_caste
+                        )
+                    )
 
                 caste = st.selectbox(
-                    "Social category",
-                    [
-                        "General",
-                        "OBC",
-                        "SC",
-                        "ST",
-                        "PVTG",
-                        "DNT",
-                    ],
+                    "Social Category",
+                    caste_options,
+                    index=caste_index,
+                )
+
+                disability_options = [
+                    "No",
+                    "Yes",
+                ]
+
+                existing_disability = (
+                    _get_profile_value(
+                        existing,
+                        "disability",
+                        "No",
+                    )
+                )
+
+                disability_index = (
+                    1
+                    if existing_disability
+                    == "Yes"
+                    else 0
                 )
 
                 disability = st.selectbox(
-                    "Person with disability?",
-                    [
+                    "Person with Disability?",
+                    disability_options,
+                    index=disability_index,
+                )
+
+                minority_options = [
+                    "No",
+                    "Yes",
+                ]
+
+                existing_minority = (
+                    _get_profile_value(
+                        existing,
+                        "minority",
                         "No",
-                        "Yes",
-                    ],
+                    )
+                )
+
+                minority_index = (
+                    1
+                    if existing_minority
+                    == "Yes"
+                    else 0
                 )
 
                 minority = st.selectbox(
-                    "Belong to minority?",
-                    [
-                        "No",
-                        "Yes",
-                    ],
+                    "Minority Community?",
+                    minority_options,
+                    index=minority_index,
+                )
+
+            with col2:
+                employment_options = [
+                    "Unemployed",
+                    "Employed",
+                    "Self Employed",
+                    "Daily Wage Worker",
+                    "Other",
+                ]
+
+                existing_employment = (
+                    _get_profile_value(
+                        existing,
+                        "employment_status",
+                        "Unemployed",
+                    )
+                )
+
+                employment_index = 0
+
+                if (
+                    existing_employment
+                    in employment_options
+                ):
+                    employment_index = (
+                        employment_options.index(
+                            existing_employment
+                        )
+                    )
+
+                employment_status = (
+                    st.selectbox(
+                        "Employment Status",
+                        employment_options,
+                        index=employment_index,
+                    )
+                )
+
+                marital_options = [
+                    "Never Married",
+                    "Married",
+                    "Widowed",
+                    "Divorced",
+                    "Separated",
+                ]
+
+                existing_marital = (
+                    _get_profile_value(
+                        existing,
+                        "marital_status",
+                        "Never Married",
+                    )
+                )
+
+                marital_index = 0
+
+                if (
+                    existing_marital
+                    in marital_options
+                ):
+                    marital_index = (
+                        marital_options.index(
+                            existing_marital
+                        )
+                    )
+
+                marital_status = (
+                    st.selectbox(
+                        "Marital Status",
+                        marital_options,
+                        index=marital_index,
+                    )
                 )
 
                 is_student = st.checkbox(
-                    "Currently a student",
-                    value=False,
+                    "Currently a Student",
+                    value=bool(
+                        _get_profile_value(
+                            existing,
+                            "is_student",
+                            False,
+                        )
+                    ),
                 )
 
-                employment_status = st.selectbox(
-                    "Current employment status",
-                    [
-                        "Unemployed",
-                        "Employed",
-                        "Self-Employed/ Entrepreneur",
-                    ],
-                )
+            col1, col2 = st.columns(2)
 
-                marital_status = st.selectbox(
-                    "Marital status",
-                    [
-                        "Never Married",
-                        "Married",
-                        "Divorced",
-                        "Separated",
-                        "Widowed",
-                    ],
-                )
-
+            with col1:
                 is_bpl = st.checkbox(
-                    "Belong to BPL category",
-                    value=True,
-                )
-
-                is_economic_distress = st.checkbox(
-                    (
-                        "Destitute / Penury / Extreme "
-                        "Hardship / Distress"
-                    ),
-                    value=False,
-                    help=(
-                        "Select this only if this "
-                        "condition applies to you."
+                    "BPL / Below Poverty Line",
+                    value=bool(
+                        _get_profile_value(
+                            existing,
+                            "is_bpl",
+                            False,
+                        )
                     ),
                 )
 
-            st.markdown(
-                "#### Income information"
-            )
+            with col2:
+                is_economic_distress = (
+                    st.checkbox(
+                        "Economic Distress",
+                        value=bool(
+                            _get_profile_value(
+                                existing,
+                                "is_economic_distress",
+                                False,
+                            )
+                        ),
+                    )
+                )
 
-            income_col1, income_col2 = (
-                st.columns(2)
-            )
+            col1, col2 = st.columns(2)
 
-            with income_col1:
+            with col1:
                 annual_family_income = (
                     st.number_input(
-                        "Annual family income (₹)",
+                        "Annual Family Income (₹)",
                         min_value=0,
-                        value=0,
+                        value=int(
+                            _get_profile_value(
+                                existing,
+                                "annual_family_income",
+                                0,
+                            )
+                        ),
                         step=10000,
                     )
                 )
 
-            with income_col2:
+            with col2:
                 annual_parent_income = (
                     st.number_input(
-                        "Annual parent income (₹)",
+                        "Annual Parent Income (₹)",
                         min_value=0,
-                        value=0,
+                        value=int(
+                            _get_profile_value(
+                                existing,
+                                "annual_parent_income",
+                                0,
+                            )
+                        ),
                         step=10000,
                     )
                 )
 
-            submitted = st.form_submit_button(
-                "Save Profile",
-                type="primary",
+            save_profile = (
+                st.form_submit_button(
+                    "Save Profile",
+                    type="primary",
+                )
             )
 
-        if submitted:
+        if save_profile:
             profile = (
                 create_livelihood_profile(
                     name=name,
@@ -504,7 +1291,9 @@ def render_livelihood_ui():
                     occupation=occupation,
                     target_role=target_role,
                     experience=experience,
-                    work_preference=work_preference,
+                    work_preference=(
+                        work_preference
+                    ),
                     language=language,
                     age=age,
                     gender=gender,
@@ -537,17 +1326,17 @@ def render_livelihood_ui():
                 "livelihood_profile"
             ] = profile
 
-            st.session_state[
-                "livelihood_jobs"
-            ] = []
+            # Clear old results because the
+            # profile has changed.
+            st.session_state.pop(
+                "livelihood_jobs",
+                None,
+            )
 
-            st.session_state[
-                "livelihood_jobs_searched"
-            ] = False
-
-            st.session_state[
-                "livelihood_scheme_result"
-            ] = None
+            st.session_state.pop(
+                "livelihood_scheme_result",
+                None,
+            )
 
             st.success(
                 "Profile saved successfully."
@@ -570,87 +1359,97 @@ def render_livelihood_ui():
                 )
             )
 
-            col1, col2, col3 = (
-                st.columns(3)
-            )
+            col1, col2 = st.columns(2)
 
             with col1:
                 st.write(
                     "**Name:**",
-                    summary["name"],
-                )
-
-                st.write(
-                    "**Age:**",
-                    summary["age"],
-                )
-
-                st.write(
-                    "**State:**",
-                    summary["state"],
-                )
-
-                st.write(
-                    "**Residence:**",
-                    summary["residence"],
-                )
-
-            with col2:
-                st.write(
-                    "**Occupation:**",
-                    summary["occupation"],
-                )
-
-                st.write(
-                    "**Target role:**",
-                    summary["target_role"],
-                )
-
-                st.write(
-                    "**Skills:**",
-                    summary["skills"],
-                )
-
-                st.write(
-                    "**Employment:**",
-                    summary[
-                        "employment_status"
-                    ],
-                )
-
-            with col3:
-                st.write(
-                    "**BPL:**",
-                    (
-                        "Yes"
-                        if summary["is_bpl"]
-                        else "No"
+                    summary.get(
+                        "name",
+                        "",
                     ),
                 )
 
                 st.write(
-                    "**Economic distress:**",
-                    (
-                        "Yes"
-                        if summary[
-                            "is_economic_distress"
-                        ]
-                        else "No"
+                    "**Location:**",
+                    summary.get(
+                        "location",
+                        "",
+                    ),
+                )
+
+                st.write(
+                    "**State:**",
+                    summary.get(
+                        "state",
+                        "",
+                    ),
+                )
+
+                st.write(
+                    "**Occupation:**",
+                    summary.get(
+                        "occupation",
+                        "",
+                    ),
+                )
+
+                st.write(
+                    "**Target Role:**",
+                    summary.get(
+                        "target_role",
+                        "",
+                    ),
+                )
+
+            with col2:
+                st.write(
+                    "**Skills:**",
+                    summary.get(
+                        "skills",
+                        "",
+                    ),
+                )
+
+                st.write(
+                    "**Experience:**",
+                    summary.get(
+                        "experience",
+                        "",
+                    ),
+                )
+
+                st.write(
+                    "**Residence:**",
+                    summary.get(
+                        "residence",
+                        "",
+                    ),
+                )
+
+                st.write(
+                    "**Employment:**",
+                    summary.get(
+                        "employment_status",
+                        "",
                     ),
                 )
 
                 st.write(
                     "**Language:**",
-                    summary["language"],
+                    summary.get(
+                        "language",
+                        "",
+                    ),
                 )
 
     # ========================================================
-    # OPPORTUNITIES
+    # TAB 2 - OPPORTUNITIES
     # ========================================================
 
     with tabs[1]:
         st.subheader(
-            "Live Opportunities"
+            "💼 Live Opportunities"
         )
 
         profile = st.session_state.get(
@@ -663,10 +1462,26 @@ def render_livelihood_ui():
             )
 
         else:
+            target_role = (
+                _get_profile_value(
+                    profile,
+                    "target_role",
+                    "",
+                )
+            )
+
+            st.write(
+                "**Target role:** "
+                + (
+                    target_role
+                    or "Open to opportunities"
+                )
+            )
+
             st.caption(
-                "Jobs are fetched live and ranked using "
-                "SkillSetu's shared matching engine. "
-                "Use the filters below to narrow the results."
+                "SkillSetu fetches a live external "
+                "job feed and ranks it using the "
+                "shared matching engine."
             )
 
             if st.button(
@@ -674,14 +1489,12 @@ def render_livelihood_ui():
                 type="primary",
             ):
                 with st.spinner(
-                    "Fetching and matching live jobs..."
+                    "Fetching live opportunities..."
                 ):
                     jobs = (
                         get_livelihood_opportunities(
                             profile,
-                            # Fetch more so the user has
-                            # enough results to filter.
-                            limit=20,
+                            limit=30,
                         )
                     )
 
@@ -689,255 +1502,214 @@ def render_livelihood_ui():
                         "livelihood_jobs"
                     ] = jobs
 
-                    st.session_state[
-                        "livelihood_jobs_searched"
-                    ] = True
-
             jobs = st.session_state.get(
-                "livelihood_jobs",
-                [],
+                "livelihood_jobs"
             )
 
-            searched = st.session_state.get(
-                "livelihood_jobs_searched",
-                False,
-            )
-
-            if jobs:
-                st.markdown(
-                    "### 🔎 Filter Opportunities"
-                )
-
-                filter_col1, filter_col2, filter_col3 = (
-                    st.columns(3)
-                )
-
-                with filter_col1:
-                    role_filter = st.text_input(
-                        "Job title contains",
-                        value="",
-                        placeholder=(
-                            "Driver, Analyst, Developer..."
-                        ),
-                        key="livelihood_job_role_filter",
-                    )
-
-                with filter_col2:
-                    minimum_match = st.slider(
-                        "Minimum match %",
-                        min_value=0,
-                        max_value=100,
-                        value=0,
-                        step=5,
-                        key="livelihood_min_match",
-                    )
-
-                with filter_col3:
-                    work_mode = st.selectbox(
-                        "Work mode",
-                        [
-                            "All",
-                            "Remote",
-                            "On-site",
-                        ],
-                        key="livelihood_work_mode_filter",
-                    )
-
-                filtered_jobs = (
-                    _filter_opportunities(
-                        jobs=jobs,
-                        role_keyword=role_filter,
-                        minimum_match=minimum_match,
-                        work_mode=work_mode,
-                    )
-                )
-
-                metric1, metric2 = (
-                    st.columns(2)
-                )
-
-                with metric1:
-                    st.metric(
-                        "Live matches",
-                        len(jobs),
-                    )
-
-                with metric2:
-                    st.metric(
-                        "After filters",
-                        len(filtered_jobs),
-                    )
-
-                if role_filter.strip():
-                    st.caption(
-                        "Filtering job titles for: "
-                        f"{role_filter.strip()}"
-                    )
-
-                if not filtered_jobs:
+            if jobs is not None:
+                if not jobs:
                     st.warning(
-                        "No currently fetched live jobs "
-                        "match these filters. Try removing "
-                        "the title filter or lowering the "
-                        "minimum match percentage."
+                        "No live opportunities were "
+                        "returned by the current source."
                     )
 
-                for index, result in enumerate(
-                    filtered_jobs,
-                    start=1,
-                ):
-                    opportunity = result.get(
-                        "opportunity",
-                        {}
+                else:
+                    target_jobs = []
+
+                    other_jobs = []
+
+                    for item in jobs:
+                        if _is_target_role_job(
+                            item,
+                            target_role,
+                        ):
+                            target_jobs.append(
+                                item
+                            )
+                        else:
+                            other_jobs.append(
+                                item
+                            )
+
+                    st.markdown(
+                        "### Filters"
                     )
 
-                    with st.container(
-                        border=True
-                    ):
-                        st.markdown(
-                            "### "
-                            f"{index}. "
-                            f"{opportunity.get('title', 'Opportunity')}"
-                        )
+                    f1, f2, f3 = (
+                        st.columns(3)
+                    )
 
-                        company = opportunity.get(
-                            "company",
-                            "Not specified",
-                        )
-
-                        location_value = (
-                            opportunity.get(
-                                "location",
-                                "Not specified",
+                    with f1:
+                        job_keyword = (
+                            st.text_input(
+                                "Search jobs",
+                                key=(
+                                    "livelihood_"
+                                    "job_keyword"
+                                ),
+                                placeholder=(
+                                    "driver, python..."
+                                ),
                             )
                         )
 
-                        remote = bool(
-                            opportunity.get(
-                                "remote",
-                                False,
+                    with f2:
+                        minimum_score = (
+                            st.slider(
+                                "Minimum match %",
+                                min_value=0,
+                                max_value=100,
+                                value=0,
+                                step=5,
+                                key=(
+                                    "livelihood_"
+                                    "minimum_score"
+                                ),
                             )
                         )
 
-                        st.write(
-                            f"**Company:** {company}"
-                        )
-
-                        st.write(
-                            "**Location:** "
-                            f"{location_value}"
-                        )
-
-                        st.write(
-                            "**Work mode:** "
-                            + (
-                                "Remote"
-                                if remote
-                                else "On-site / location based"
+                    with f3:
+                        work_mode = (
+                            st.selectbox(
+                                "Work mode",
+                                [
+                                    "All",
+                                    "Remote",
+                                    "On-site",
+                                ],
+                                key=(
+                                    "livelihood_"
+                                    "work_mode"
+                                ),
                             )
                         )
 
-                        score = _get_match_score(
-                            result
+                    filtered_target = (
+                        _filter_jobs(
+                            target_jobs,
+                            keyword=job_keyword,
+                            minimum_score=(
+                                minimum_score
+                            ),
+                            work_mode=(
+                                work_mode
+                            ),
                         )
+                    )
 
+                    filtered_other = (
+                        _filter_jobs(
+                            other_jobs,
+                            keyword=job_keyword,
+                            minimum_score=(
+                                minimum_score
+                            ),
+                            work_mode=(
+                                work_mode
+                            ),
+                        )
+                    )
+
+                    m1, m2, m3 = (
+                        st.columns(3)
+                    )
+
+                    with m1:
                         st.metric(
-                            "Match",
-                            f"{score}%",
+                            "Live Jobs Processed",
+                            len(jobs),
                         )
 
-                        matched = result.get(
-                            "matched_skills",
-                            [],
+                    with m2:
+                        st.metric(
+                            "Target-Role Matches",
+                            len(
+                                filtered_target
+                            ),
                         )
 
-                        missing = result.get(
-                            "missing_skills",
-                            [],
+                    with m3:
+                        st.metric(
+                            "Other Live Jobs",
+                            len(
+                                filtered_other
+                            ),
                         )
 
-                        if matched:
-                            st.write(
-                                "**Matched skills:** "
-                                + ", ".join(
-                                    matched
+                    st.divider()
+
+                    st.markdown(
+                        "## 🎯 Recommended for "
+                        "Your Target Role"
+                    )
+
+                    if filtered_target:
+                        for index, item in enumerate(
+                            filtered_target,
+                            start=1,
+                        ):
+                            _render_job_card(
+                                item,
+                                index,
+                                "target_job",
+                            )
+
+                    else:
+                        st.info(
+                            "No live job titles matching "
+                            f"'{target_role}' were found "
+                            "in the current feed. "
+                            "SkillSetu will not label "
+                            "unrelated roles as direct "
+                            "target-role recommendations."
+                        )
+
+                    if filtered_other:
+                        st.divider()
+
+                        with st.expander(
+                            "🌐 Other Live Opportunities "
+                            f"({len(filtered_other)})"
+                        ):
+                            st.caption(
+                                "These jobs are from the "
+                                "live feed but do not match "
+                                "your target-role title. "
+                                "They are shown only for "
+                                "exploration."
+                            )
+
+                            for index, item in enumerate(
+                                filtered_other,
+                                start=1,
+                            ):
+                                _render_job_card(
+                                    item,
+                                    index,
+                                    "other_job",
                                 )
-                            )
 
-                        if missing:
-                            st.write(
-                                "**Skill gaps:** "
-                                + ", ".join(
-                                    missing
-                                )
-                            )
-
-                        reasons = result.get(
-                            "reasons",
-                            [],
-                        )
-
-                        if reasons:
-                            st.write(
-                                "**Why this matches:**"
-                            )
-
-                            for reason in reasons:
-                                st.write(
-                                    f"- {reason}"
-                                )
-
-                        source = opportunity.get(
-                            "source",
-                            "Live job feed",
-                        )
-
-                        fetched_at = (
-                            opportunity.get(
-                                "fetched_at",
-                                "",
-                            )
-                        )
-
-                        st.caption(
-                            f"Source: {source}"
-                            + (
-                                f" • Fetched: {fetched_at}"
-                                if fetched_at
-                                else ""
-                            )
-                        )
-
-                        url = opportunity.get(
-                            "url"
-                        )
-
-                        if url:
-                            st.link_button(
-                                "View Job",
-                                url,
-                            )
-
-            elif searched:
-                st.warning(
-                    "The live job feed returned no "
-                    "matching opportunities for this "
-                    "profile right now."
-                )
+                    st.caption(
+                        "Current live opportunity source "
+                        "is primarily European. "
+                        "SkillSetu therefore does not "
+                        "claim these are local Guntur "
+                        "or India vacancies."
+                    )
 
             else:
                 st.info(
-                    "Click Find Live Opportunities "
+                    "Click **Find Live Opportunities** "
                     "to search the live job feed."
                 )
 
     # ========================================================
-    # GOVERNMENT SCHEMES
+    # TAB 3 - GOVERNMENT SCHEMES
     # ========================================================
 
     with tabs[2]:
         st.subheader(
-            "Government Schemes"
+            "🏛️ Government Schemes"
         )
 
         profile = st.session_state.get(
@@ -951,9 +1723,9 @@ def render_livelihood_ui():
 
         else:
             st.caption(
-                "SkillSetu searches live myScheme, "
-                "indexes official scheme information, "
-                "and uses RAG to retrieve relevant results."
+                "SkillSetu searches live myScheme "
+                "results, evaluates profile relevance "
+                "and uses RAG for semantic ranking."
             )
 
             if st.button(
@@ -961,23 +1733,18 @@ def render_livelihood_ui():
                 type="primary",
             ):
                 with st.spinner(
-                    (
-                        "Searching live myScheme and "
-                        "building scheme recommendations..."
-                    )
+                    "Searching live myScheme..."
                 ):
-                    scheme_result = (
+                    result = (
                         get_livelihood_schemes(
                             profile,
-                            # Fetch more candidates so
-                            # filters remain useful.
-                            limit=10,
+                            limit=5,
                         )
                     )
 
                     st.session_state[
                         "livelihood_scheme_result"
-                    ] = scheme_result
+                    ] = result
 
             result = st.session_state.get(
                 "livelihood_scheme_result"
@@ -989,354 +1756,352 @@ def render_livelihood_ui():
                     "",
                 )
 
-                schemes = result.get(
+                live_schemes = result.get(
                     "schemes",
                     [],
                 )
 
-                retrieved = result.get(
+                recommended = result.get(
                     "retrieved",
                     [],
                 )
 
+                all_ranked = result.get(
+                    "all_ranked",
+                    [],
+                )
+
+                indexed_chunks = result.get(
+                    "indexed_chunks",
+                    0,
+                )
+
+                ranking_method = result.get(
+                    "ranking_method",
+                    "",
+                )
+
                 if error:
-                    st.warning(error)
-
-                if schemes:
-                    metric1, metric2, metric3 = (
-                        st.columns(3)
+                    st.warning(
+                        error
                     )
 
-                    with metric1:
-                        st.metric(
-                            "Live schemes fetched",
-                            len(schemes),
-                        )
+                # --------------------------------------------
+                # METRICS
+                # --------------------------------------------
 
-                    with metric2:
-                        st.metric(
-                            "RAG chunks indexed",
-                            result.get(
-                                "indexed_chunks",
-                                0,
-                            ),
-                        )
+                m1, m2, m3 = (
+                    st.columns(3)
+                )
 
-                    with metric3:
-                        ranking_method = (
-                            result.get(
-                                "ranking_method",
-                                "live",
-                            )
-                        )
+                with m1:
+                    st.metric(
+                        "Live Schemes",
+                        len(
+                            live_schemes
+                        ),
+                    )
 
-                        st.metric(
-                            "Recommendations",
-                            len(retrieved),
+                with m2:
+                    st.metric(
+                        "Recommended",
+                        len(
+                            recommended
+                        ),
+                    )
+
+                with m3:
+                    st.metric(
+                        "RAG Chunks",
+                        indexed_chunks,
+                    )
+
+                if ranking_method:
+                    pretty_method = (
+                        ranking_method
+                        .replace(
+                            "_plus_",
+                            " + ",
                         )
+                        .replace(
+                            "_",
+                            " ",
+                        )
+                        .title()
+                    )
 
                     st.caption(
-                        "Ranking method: "
-                        f"{ranking_method}"
+                        "Recommendation method: "
+                        + pretty_method
                     )
 
-                if retrieved:
-                    st.markdown(
-                        "### 🔎 Filter Schemes"
+                st.info(
+                    "Scheme scores indicate profile "
+                    "relevance, not guaranteed official "
+                    "eligibility. Verify final eligibility "
+                    "on the official myScheme page."
+                )
+
+                # --------------------------------------------
+                # OPTIONAL UI FILTER
+                # --------------------------------------------
+
+                scheme_keyword = (
+                    st.text_input(
+                        "Filter schemes",
+                        key=(
+                            "livelihood_"
+                            "scheme_keyword"
+                        ),
+                        placeholder=(
+                            "farmer, training, "
+                            "financial assistance..."
+                        ),
                     )
+                )
 
-                    scheme_col1, scheme_col2 = (
-                        st.columns(2)
+                normalized_keyword = (
+                    _normalize(
+                        scheme_keyword
                     )
+                )
 
-                    with scheme_col1:
-                        scheme_keyword = (
-                            st.text_input(
-                                "Scheme keyword",
-                                value="",
-                                placeholder=(
-                                    "farmer, agriculture, "
-                                    "training, employment..."
-                                ),
-                                key=(
-                                    "livelihood_scheme_keyword"
-                                ),
-                            )
-                        )
-
-                    with scheme_col2:
-                        scheme_scope = (
-                            st.selectbox(
-                                "Scheme location",
+                if normalized_keyword:
+                    recommended_display = [
+                        item
+                        for item in recommended
+                        if normalized_keyword
+                        in _normalize(
+                            " ".join(
                                 [
-                                    "All",
-                                    "My State",
-                                    "Central / National",
-                                ],
-                                key=(
-                                    "livelihood_scheme_scope"
-                                ),
+                                    item.get(
+                                        "scheme_name",
+                                        "",
+                                    ),
+                                    item.get(
+                                        "text",
+                                        "",
+                                    ),
+                                    item.get(
+                                        "category",
+                                        "",
+                                    ),
+                                ]
                             )
                         )
+                    ]
 
-                    filtered_schemes = (
-                        _filter_schemes(
-                            retrieved,
-                            keyword=scheme_keyword,
-                            state_filter=(
-                                scheme_scope
-                            ),
+                    all_display = [
+                        item
+                        for item in all_ranked
+                        if normalized_keyword
+                        in _normalize(
+                            " ".join(
+                                [
+                                    item.get(
+                                        "scheme_name",
+                                        "",
+                                    ),
+                                    item.get(
+                                        "text",
+                                        "",
+                                    ),
+                                    item.get(
+                                        "category",
+                                        "",
+                                    ),
+                                ]
+                            )
                         )
+                    ]
+
+                else:
+                    recommended_display = (
+                        recommended
                     )
 
-                    # ----------------------------------------
-                    # STATE FILTER
-                    # ----------------------------------------
+                    all_display = (
+                        all_ranked
+                    )
 
-                    if (
-                        scheme_scope
-                        == "My State"
-                    ):
-                        profile_state = str(
-                            getattr(
-                                profile,
-                                "state",
-                                "",
-                            )
-                        ).strip().lower()
+                # --------------------------------------------
+                # RECOMMENDED
+                # --------------------------------------------
 
-                        state_filtered = []
+                if recommended_display:
+                    st.divider()
 
-                        for item in filtered_schemes:
-                            item_state = str(
-                                item.get(
-                                    "state",
-                                    "",
-                                )
-                            ).strip().lower()
-
-                            # Keep blank-state schemes because
-                            # many central schemes do not expose
-                            # state metadata in every RAG chunk.
-                            if (
-                                not item_state
-                                or not profile_state
-                                or profile_state
-                                in item_state
-                                or item_state
-                                in profile_state
-                            ):
-                                state_filtered.append(
-                                    item
-                                )
-
-                        filtered_schemes = (
-                            state_filtered
-                        )
-
-                    elif (
-                        scheme_scope
-                        == "Central / National"
-                    ):
-                        national_terms = {
-                            "",
-                            "all india",
-                            "india",
-                            "central",
-                            "national",
-                        }
-
-                        national_filtered = []
-
-                        for item in filtered_schemes:
-                            item_state = str(
-                                item.get(
-                                    "state",
-                                    "",
-                                )
-                            ).strip().lower()
-
-                            if (
-                                item_state
-                                in national_terms
-                            ):
-                                national_filtered.append(
-                                    item
-                                )
-
-                        filtered_schemes = (
-                            national_filtered
-                        )
+                    st.markdown(
+                        "## ⭐ Recommended for You"
+                    )
 
                     st.caption(
-                        f"Showing {len(filtered_schemes)} "
-                        f"of {len(retrieved)} retrieved "
-                        "scheme recommendations."
+                        "The strongest profile-relevant "
+                        "schemes from the current live "
+                        "myScheme results."
                     )
 
+                    for index, item in enumerate(
+                        recommended_display,
+                        start=1,
+                    ):
+                        _render_scheme_card(
+                            item,
+                            index,
+                            "recommended_scheme",
+                            detailed=True,
+                        )
+
+                elif recommended:
                     st.info(
-                        "These are profile-relevant results "
-                        "from live myScheme/RAG. Final "
-                        "eligibility should be verified on "
-                        "the official scheme page."
+                        "No recommended schemes match "
+                        "the current UI filter."
                     )
 
-                    if not filtered_schemes:
-                        st.warning(
-                            "No retrieved schemes match "
-                            "the current filters. Try "
-                            "clearing the keyword or "
-                            "selecting All."
+                elif live_schemes:
+                    st.warning(
+                        "Live schemes were found, but "
+                        "no recommendation was produced."
+                    )
+
+                # --------------------------------------------
+                # ALL LIVE SCHEMES
+                # --------------------------------------------
+
+                if all_ranked:
+                    st.divider()
+
+                    with st.expander(
+                        "📋 View All Live Schemes "
+                        f"({len(all_display)})"
+                    ):
+                        st.caption(
+                            "All unique live schemes "
+                            "returned for this search, "
+                            "ordered by SkillSetu's "
+                            "profile-relevance ranking."
                         )
 
-                    seen_urls = set()
+                        if not all_display:
+                            st.info(
+                                "No live schemes match "
+                                "the current UI filter."
+                            )
 
-                    display_index = 0
-
-                    for item in filtered_schemes:
-                        url = item.get(
-                            "url",
-                            "",
-                        )
-
-                        if (
-                            url
-                            and url in seen_urls
+                        for index, item in enumerate(
+                            all_display,
+                            start=1,
                         ):
-                            continue
-
-                        if url:
-                            seen_urls.add(
-                                url
+                            _render_scheme_card(
+                                item,
+                                index,
+                                "all_scheme",
+                                detailed=False,
                             )
 
-                        display_index += 1
+                # --------------------------------------------
+                # OLD SESSION / FALLBACK SUPPORT
+                # --------------------------------------------
 
-                        scheme_name = item.get(
-                            "scheme_name",
-                            "Government Scheme",
+                elif live_schemes:
+                    st.divider()
+
+                    with st.expander(
+                        "📋 View All Live Schemes "
+                        f"({len(live_schemes)})"
+                    ):
+                        st.caption(
+                            "These are the live myScheme "
+                            "results returned for the "
+                            "current profile."
                         )
 
-                        with st.container(
-                            border=True
+                        for index, scheme in enumerate(
+                            live_schemes,
+                            start=1,
                         ):
-                            st.markdown(
-                                f"### {display_index}. "
-                                f"{scheme_name}"
+                            name = (
+                                scheme.get(
+                                    "scheme_name"
+                                )
+                                or scheme.get(
+                                    "name"
+                                )
+                                or "Government Scheme"
                             )
 
-                            # We deliberately say
-                            # "Profile relevance", not
-                            # "Eligible".
-                            st.write(
-                                "**Profile relevance:** "
-                                "Potential match"
+                            description = (
+                                scheme.get(
+                                    "description",
+                                    "",
+                                )
                             )
 
-                            text = item.get(
-                                "text",
+                            url = scheme.get(
+                                "url",
                                 "",
                             )
 
-                            if text:
-                                st.write(
-                                    text[:1500]
+                            with st.container(
+                                border=True
+                            ):
+                                st.markdown(
+                                    f"### {index}. "
+                                    f"{name}"
                                 )
 
-                            state_value = item.get(
-                                "state",
-                                "",
-                            )
+                                if description:
+                                    st.write(
+                                        description[
+                                            :600
+                                        ]
+                                    )
 
-                            if state_value:
-                                st.write(
-                                    "**Scheme location:** "
-                                    f"{state_value}"
+                                st.caption(
+                                    "Live result from "
+                                    "myScheme."
                                 )
 
-                            category = item.get(
-                                "category",
-                                "",
-                            )
+                                if url:
+                                    st.link_button(
+                                        "Open Official "
+                                        "myScheme Page",
+                                        url,
+                                        key=(
+                                            "raw_scheme_"
+                                            f"{index}"
+                                        ),
+                                    )
 
-                            if category:
-                                st.write(
-                                    "**Category:** "
-                                    f"{category}"
-                                )
-
-                            source = item.get(
-                                "source",
-                                "myScheme",
-                            )
-
-                            fetched_at = item.get(
-                                "fetched_at",
-                                "",
-                            )
-
-                            st.caption(
-                                f"Source: {source}"
-                                + (
-                                    f" • Fetched: {fetched_at}"
-                                    if fetched_at
-                                    else ""
-                                )
-                            )
-
-                            if url:
-                                st.link_button(
-                                    "Open Official Scheme",
-                                    url,
-                                )
-
-                    if display_index == 0:
-                        st.warning(
-                            "No unique schemes remain "
-                            "after filtering."
-                        )
-
-                elif schemes:
-                    st.info(
-                        "Live schemes were fetched, but "
-                        "semantic retrieval returned no "
-                        "results."
-                    )
-
-                elif not error:
-                    st.info(
-                        "No live schemes were returned."
+                if (
+                    not live_schemes
+                    and not error
+                ):
+                    st.warning(
+                        "No live schemes were returned "
+                        "for this profile."
                     )
 
             else:
                 st.info(
-                    "Click Find Government Schemes "
+                    "Click **Find Government Schemes** "
                     "to search live myScheme."
                 )
 
         st.divider()
 
         st.caption(
-            "Architecture proof: Livelihood Profile → "
-            "Live myScheme → ChromaDB → RAG. "
-            "Jobs use the shared matching_engine(). "
-            "Filters are applied after live retrieval."
+            "Live myScheme → Profile Fit → "
+            "ChromaDB RAG → Ranked Recommendations"
         )
 
     # ========================================================
-    # VOICE ASSISTANT
+    # TAB 4 - VOICE ASSISTANT
     # ========================================================
 
     with tabs[3]:
         st.subheader(
             "🎙️ Voice Assistant"
-        )
-
-        st.caption(
-            "Speak in Telugu, English, or Hindi. "
-            "Sarvam AI converts your speech to text, "
-            "SkillSetu prepares guidance using your profile, "
-            "and the answer is spoken back to you."
         )
 
         profile = st.session_state.get(
@@ -1345,52 +2110,51 @@ def render_livelihood_ui():
 
         if not profile:
             st.warning(
-                "Create and save your livelihood profile "
-                "before using the Voice Assistant."
+                "Create your profile first."
             )
 
         else:
-            preferred_language = getattr(
-                profile,
-                "language",
-                "Telugu",
+            preferred_language = (
+                _get_profile_value(
+                    profile,
+                    "language",
+                    "Telugu",
+                )
             )
 
-            st.info(
-                "Preferred response language: "
+            st.write(
+                "**Preferred language:** "
                 f"{preferred_language}"
             )
 
-            st.markdown(
-                "#### 🎤 Speak to SkillSetu"
+            st.caption(
+                "Speak naturally. SkillSetu uses "
+                "Sarvam AI for speech-to-text, "
+                "translation and speech output."
             )
 
-            recorded_audio = st.audio_input(
-                "Record your question"
+            audio_value = st.audio_input(
+                "Ask SkillSetu about jobs, "
+                "skills or government schemes"
             )
 
-            if recorded_audio is not None:
-                st.audio(
-                    recorded_audio
+            if audio_value is not None:
+                audio_bytes = (
+                    audio_value.getvalue()
                 )
 
                 if st.button(
-                    "Ask with Voice",
+                    "Process Voice Question",
                     type="primary",
-                    key="livelihood_voice_ask",
                 ):
                     try:
                         with st.spinner(
-                            "Listening and preparing "
-                            "your answer..."
+                            "Understanding your "
+                            "question..."
                         ):
-                            audio_bytes = (
-                                recorded_audio.getvalue()
-                            )
-
                             voice_result = (
                                 process_voice_turn(
-                                    audio_bytes=audio_bytes,
+                                    audio_bytes,
                                     profile=profile,
                                     preferred_language=(
                                         preferred_language
@@ -1399,40 +2163,28 @@ def render_livelihood_ui():
                                 )
                             )
 
-                            st.session_state[
-                                "livelihood_voice_result"
-                            ] = voice_result
+                        st.session_state[
+                            "livelihood_voice_result"
+                        ] = voice_result
 
                     except Exception as exc:
                         st.error(
-                            "Voice processing failed. "
-                            "You can still use the text "
-                            "question box below."
+                            "Voice assistant error: "
+                            f"{exc}"
                         )
 
-                        st.caption(
-                            f"Technical detail: {exc}"
-                        )
-
-            voice_result = st.session_state.get(
-                "livelihood_voice_result"
+            voice_result = (
+                st.session_state.get(
+                    "livelihood_voice_result"
+                )
             )
 
             if voice_result:
-                st.divider()
-
-                st.markdown(
-                    "#### 📝 What you said"
-                )
-
-                transcript = voice_result.get(
-                    "transcript",
-                    "",
-                )
-
-                st.write(
-                    transcript
-                    or "No transcript was returned."
+                transcript = (
+                    voice_result.get(
+                        "transcript",
+                        "",
+                    )
                 )
 
                 detected_language = (
@@ -1442,16 +2194,6 @@ def render_livelihood_ui():
                     )
                 )
 
-                if detected_language:
-                    st.caption(
-                        "Detected language: "
-                        f"{detected_language}"
-                    )
-
-                st.markdown(
-                    "#### 🤖 SkillSetu response"
-                )
-
                 response_text = (
                     voice_result.get(
                         "response_text",
@@ -1459,153 +2201,76 @@ def render_livelihood_ui():
                     )
                 )
 
-                if response_text:
-                    st.write(
-                        response_text
-                    )
-
-                response_audio = (
+                audio_response = (
                     voice_result.get(
                         "audio_bytes"
                     )
                 )
 
-                if response_audio:
+                if transcript:
+                    st.markdown(
+                        "### You said"
+                    )
+
+                    st.write(
+                        transcript
+                    )
+
+                if detected_language:
+                    st.caption(
+                        "Detected language: "
+                        f"{detected_language}"
+                    )
+
+                if response_text:
+                    st.markdown(
+                        "### SkillSetu"
+                    )
+
+                    st.write(
+                        response_text
+                    )
+
+                if audio_response:
                     st.audio(
-                        response_audio,
-                        format="audio/wav",
-                    )
-
-            st.divider()
-
-            st.markdown(
-                "#### ⌨️ Text fallback"
-            )
-
-            st.caption(
-                "If microphone permission or speech "
-                "recognition does not work during the "
-                "demo, type the same question here."
-            )
-
-            typed_question = st.text_input(
-                "Ask about jobs, skills, or "
-                "government schemes",
-                key=(
-                    "livelihood_voice_text_question"
-                ),
-                placeholder=(
-                    "Example: నాకు ఉద్యోగాలు "
-                    "ఏమైనా ఉన్నాయా?"
-                ),
-            )
-
-            if st.button(
-                "Ask with Text",
-                key="livelihood_text_ask",
-            ):
-                if not typed_question.strip():
-                    st.warning(
-                        "Type a question first."
-                    )
-
-                else:
-                    try:
-                        with st.spinner(
-                            "Preparing your answer..."
-                        ):
-                            english_response = (
-                                build_livelihood_voice_response(
-                                    typed_question,
-                                    profile=profile,
-                                )
-                            )
-
-                            try:
-                                localized_response = (
-                                    translate_text(
-                                        english_response,
-                                        target_language=(
-                                            preferred_language
-                                        ),
-                                    )
-                                )
-
-                            except Exception:
-                                localized_response = (
-                                    english_response
-                                )
-
-                            try:
-                                response_audio = (
-                                    text_to_speech(
-                                        localized_response,
-                                        language=(
-                                            preferred_language
-                                        ),
-                                    )
-                                )
-
-                            except Exception:
-                                response_audio = None
-
-                            st.session_state[
-                                "livelihood_text_voice_result"
-                            ] = {
-                                "question": (
-                                    typed_question
-                                ),
-                                "response_text": (
-                                    localized_response
-                                ),
-                                "audio_bytes": (
-                                    response_audio
-                                ),
-                            }
-
-                    except Exception as exc:
-                        st.error(
-                            "Could not prepare "
-                            "the response."
-                        )
-
-                        st.caption(
-                            f"Technical detail: {exc}"
-                        )
-
-            text_result = st.session_state.get(
-                "livelihood_text_voice_result"
-            )
-
-            if text_result:
-                st.markdown(
-                    "#### 🤖 SkillSetu response"
-                )
-
-                st.write(
-                    text_result.get(
-                        "response_text",
-                        "",
-                    )
-                )
-
-                text_audio = (
-                    text_result.get(
-                        "audio_bytes"
-                    )
-                )
-
-                if text_audio:
-                    st.audio(
-                        text_audio,
+                        audio_response,
                         format="audio/wav",
                     )
 
             st.divider()
 
             st.caption(
-                "Voice pipeline: Microphone → "
-                "Sarvam STT → SkillSetu livelihood "
-                "guidance → Sarvam translation → "
-                "Sarvam TTS."
+                "Voice pipeline: "
+                "Microphone → Sarvam STT → "
+                "SkillSetu Guidance → Translation → "
+                "Sarvam TTS"
             )
+
+    # ========================================================
+    # ARCHITECTURE / JUDGE PROOF
+    # ========================================================
+
+    st.divider()
+
+    with st.expander(
+        "🧠 How SkillSetu Works"
+    ):
+        st.markdown(
+            """
+**One shared guidance architecture**
+
+**Opportunities**
+
+`Livelihood Profile → Live Job API → Shared Matching Engine → Target-Role Validation → Recommendations`
+
+**Government Schemes**
+
+`Livelihood Profile → Live myScheme → Profile-Fit Ranking → ChromaDB RAG → Recommendations`
+
+**Voice**
+
+`Microphone → Sarvam AI STT → SkillSetu → Translation → Sarvam AI TTS`
+
+SkillSetu keeps live-data sources visible and does not treat a recommendation as guaranteed scheme eligibility.
+"""
+        )

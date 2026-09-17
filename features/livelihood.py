@@ -1,25 +1,31 @@
 """
 SkillSetu - Livelihood Backend
 
-Shared flow:
-Livelihood Profile
-    -> Live Jobs
-    -> Shared Matching Engine
+Shared jobs:
+Profile -> Live Jobs -> Shared matching_engine()
 
-Livelihood Profile
-    -> Live myScheme
-    -> Optional RAG Ranking
-    -> Safe Live-Scheme Fallback
+Government schemes:
+Profile -> Live myScheme -> Profile Fit Filter
+        -> RAG -> Ranked Recommendations
+
+IMPORTANT:
+Scheme fit is recommendation relevance.
+It is NOT a guarantee of legal/official eligibility.
 """
 
 from dataclasses import dataclass, field, asdict
 from typing import List
+import re
 
 from core.matching_engine import matching_engine
 from core.retrieval import index_schemes, retrieve_schemes
 from data.jobs import fetch_jobs
 from data.schemes import fetch_schemes
 
+
+# ============================================================
+# PROFILE
+# ============================================================
 
 @dataclass
 class LivelihoodProfile:
@@ -36,7 +42,6 @@ class LivelihoodProfile:
     work_preference: str = "local"
     language: str = "Telugu"
 
-    # myScheme fields
     age: int = 18
     gender: str = "Male"
     state: str = "Andhra Pradesh"
@@ -109,8 +114,12 @@ def create_livelihood_profile(
         disability=str(disability).strip(),
         minority=str(minority).strip(),
         is_student=bool(is_student),
-        employment_status=str(employment_status).strip(),
-        marital_status=str(marital_status).strip(),
+        employment_status=str(
+            employment_status
+        ).strip(),
+        marital_status=str(
+            marital_status
+        ).strip(),
         is_bpl=bool(is_bpl),
         is_economic_distress=bool(
             is_economic_distress
@@ -130,7 +139,7 @@ def create_livelihood_profile(
 
 def get_livelihood_opportunities(
     profile,
-    limit=5,
+    limit=30,
 ):
     if profile is None:
         return []
@@ -139,24 +148,26 @@ def get_livelihood_opportunities(
         jobs = fetch_jobs(profile)
 
     except Exception as exc:
-        print("Live job retrieval failed:")
-        print(repr(exc))
+        print(
+            "Live job retrieval failed:",
+            repr(exc),
+        )
         return []
 
     if not jobs:
         return []
 
     try:
-        # IMPORTANT:
-        # Student + Livelihood use the SAME engine.
         ranked_jobs = matching_engine(
             profile,
             jobs,
         )
 
     except Exception as exc:
-        print("Shared matching engine failed:")
-        print(repr(exc))
+        print(
+            "Shared matching engine failed:",
+            repr(exc),
+        )
         return []
 
     return ranked_jobs[:limit]
@@ -172,16 +183,21 @@ def build_myscheme_profile(profile):
 
     data = asdict(profile)
 
-    # Exact aliases expected by live myScheme flow.
-    data["isStudent"] = profile.is_student
+    data["isStudent"] = (
+        profile.is_student
+    )
+
     data["employmentStatus"] = (
         profile.employment_status
     )
+
     data["maritalStatus"] = (
         profile.marital_status
     )
 
-    data["isBpl"] = profile.is_bpl
+    data["isBpl"] = (
+        profile.is_bpl
+    )
 
     data["isEconomicDistress"] = (
         profile.is_economic_distress
@@ -199,52 +215,814 @@ def build_myscheme_profile(profile):
 
 
 # ============================================================
-# LIVE-SCHEME FALLBACK
+# SCHEME FIT HELPERS
 # ============================================================
 
-def _scheme_to_retrieved_item(scheme):
-    """
-    Convert a live myScheme result into the same basic
-    structure expected by the Streamlit recommendation UI.
+def _normalize(value):
+    return " ".join(
+        str(value or "")
+        .lower()
+        .strip()
+        .split()
+    )
 
-    This allows government schemes to remain visible even
-    when sentence-transformers / ChromaDB fails.
+
+def _contains_phrase(
+    text,
+    phrase,
+):
+    text = _normalize(text)
+    phrase = _normalize(phrase)
+
+    if not text or not phrase:
+        return False
+
+    pattern = (
+        r"\b"
+        + re.escape(phrase)
+        + r"\b"
+    )
+
+    return bool(
+        re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _scheme_full_text(scheme):
+    parts = [
+        scheme.get(
+            "scheme_name",
+            "",
+        ),
+        scheme.get(
+            "name",
+            "",
+        ),
+        scheme.get(
+            "description",
+            "",
+        ),
+        scheme.get(
+            "eligibility_signals",
+            "",
+        ),
+        scheme.get(
+            "benefits",
+            "",
+        ),
+        scheme.get(
+            "application_info",
+            "",
+        ),
+        scheme.get(
+            "category",
+            "",
+        ),
+        scheme.get(
+            "state",
+            "",
+        ),
+    ]
+
+    return _normalize(
+        " ".join(
+            str(part)
+            for part in parts
+            if part
+        )
+    )
+
+
+# ============================================================
+# SCHEME PROFILE-FIT ENGINE
+# ============================================================
+
+def evaluate_scheme_fit(
+    scheme,
+    profile,
+):
+    """
+    Rank a LIVE myScheme result against the livelihood
+    profile.
+
+    This determines recommendation relevance only.
+
+    It deliberately does NOT return "Eligible" or
+    "Not Eligible".
     """
 
+    text = _scheme_full_text(
+        scheme
+    )
+
+    score = 40
+
+    reasons = []
+    warnings = []
+
+    # --------------------------------------------------------
+    # STATE
+    # --------------------------------------------------------
+
+    profile_state = _normalize(
+        profile.state
+    )
+
+    scheme_state = _normalize(
+        scheme.get(
+            "state",
+            "",
+        )
+    )
+
+    national_values = {
+        "",
+        "all india",
+        "india",
+        "central",
+        "national",
+        "central government",
+    }
+
+    if scheme_state:
+        if (
+            profile_state
+            and (
+                profile_state in scheme_state
+                or scheme_state in profile_state
+            )
+        ):
+            score += 15
+
+            reasons.append(
+                f"Scheme location matches "
+                f"{profile.state}."
+            )
+
+        elif (
+            scheme_state
+            not in national_values
+        ):
+            score -= 25
+
+            warnings.append(
+                "Scheme may be associated with "
+                f"{scheme.get('state')} rather than "
+                f"{profile.state}."
+            )
+
+    else:
+        reasons.append(
+            "No conflicting state restriction was "
+            "identified in the retrieved metadata."
+        )
+
+    # --------------------------------------------------------
+    # OCCUPATION
+    # --------------------------------------------------------
+
+    occupation = _normalize(
+        profile.occupation
+    )
+
+    if (
+        occupation
+        and _contains_phrase(
+            text,
+            occupation,
+        )
+    ):
+        score += 15
+
+        reasons.append(
+            "Scheme information relates to your "
+            f"occupation: {profile.occupation}."
+        )
+
+    # Common livelihood occupation groups.
+
+    occupation_groups = {
+        "farmer": [
+            "farmer",
+            "farmers",
+            "agriculture",
+            "agricultural",
+            "farming",
+            "crop",
+            "cultivation",
+            "kisan",
+        ],
+
+        "driver": [
+            "driver",
+            "driving",
+            "transport",
+            "vehicle",
+            "commercial vehicle",
+        ],
+
+        "artisan": [
+            "artisan",
+            "handicraft",
+            "handloom",
+            "craft",
+            "weaver",
+        ],
+
+        "fisher": [
+            "fisher",
+            "fisherman",
+            "fisheries",
+            "fishing",
+        ],
+
+        "worker": [
+            "worker",
+            "labour",
+            "labor",
+            "wage worker",
+            "unorganised worker",
+            "unorganized worker",
+        ],
+    }
+
+    profile_terms = " ".join(
+        [
+            _normalize(
+                profile.occupation
+            ),
+            _normalize(
+                profile.target_role
+            ),
+            " ".join(
+                _normalize(skill)
+                for skill in profile.skills
+            ),
+        ]
+    )
+
+    occupation_group_match = False
+
+    for group, terms in (
+        occupation_groups.items()
+    ):
+        profile_in_group = any(
+            _contains_phrase(
+                profile_terms,
+                term,
+            )
+            for term in terms
+        )
+
+        scheme_in_group = any(
+            _contains_phrase(
+                text,
+                term,
+            )
+            for term in terms
+        )
+
+        if (
+            profile_in_group
+            and scheme_in_group
+        ):
+            occupation_group_match = True
+
+            score += 10
+
+            reasons.append(
+                f"Scheme aligns with your "
+                f"{group}-related livelihood."
+            )
+
+            break
+
+    # --------------------------------------------------------
+    # SKILLS
+    # --------------------------------------------------------
+
+    matched_skills = []
+
+    for skill in profile.skills:
+        if _contains_phrase(
+            text,
+            skill,
+        ):
+            matched_skills.append(
+                skill
+            )
+
+    if matched_skills:
+        score += min(
+            12,
+            4 * len(
+                matched_skills
+            ),
+        )
+
+        reasons.append(
+            "Related skills found: "
+            + ", ".join(
+                matched_skills
+            )
+            + "."
+        )
+
+    # --------------------------------------------------------
+    # RURAL PROFILE
+    # --------------------------------------------------------
+
+    if (
+        _normalize(
+            profile.residence
+        )
+        == "rural"
+    ):
+        rural_terms = [
+            "rural",
+            "village",
+            "gram",
+            "agriculture",
+            "farmer",
+            "panchayat",
+        ]
+
+        if any(
+            _contains_phrase(
+                text,
+                term,
+            )
+            for term in rural_terms
+        ):
+            score += 8
+
+            reasons.append(
+                "Scheme contains rural/livelihood "
+                "signals matching your residence."
+            )
+
+    # --------------------------------------------------------
+    # EMPLOYMENT
+    # --------------------------------------------------------
+
+    employment = _normalize(
+        profile.employment_status
+    )
+
+    if employment == "unemployed":
+        employment_terms = [
+            "unemployed",
+            "employment",
+            "livelihood",
+            "skill development",
+            "training",
+            "self employment",
+            "self-employment",
+        ]
+
+        if any(
+            _contains_phrase(
+                text,
+                term,
+            )
+            for term in employment_terms
+        ):
+            score += 8
+
+            reasons.append(
+                "Scheme relates to employment, "
+                "livelihood or skill development."
+            )
+
+    # --------------------------------------------------------
+    # BPL
+    # --------------------------------------------------------
+
+    bpl_terms = [
+        "bpl",
+        "below poverty line",
+        "economically weaker",
+        "low income",
+        "poor families",
+    ]
+
+    scheme_mentions_bpl = any(
+        _contains_phrase(
+            text,
+            term,
+        )
+        for term in bpl_terms
+    )
+
+    if (
+        profile.is_bpl
+        and scheme_mentions_bpl
+    ):
+        score += 12
+
+        reasons.append(
+            "Scheme contains BPL / low-income signals "
+            "matching your profile."
+        )
+
+    # --------------------------------------------------------
+    # ECONOMIC DISTRESS
+    # --------------------------------------------------------
+
+    distress_terms = [
+        "economic distress",
+        "destitute",
+        "penury",
+        "extreme hardship",
+        "financial assistance",
+    ]
+
+    if (
+        profile.is_economic_distress
+        and any(
+            _contains_phrase(
+                text,
+                term,
+            )
+            for term in distress_terms
+        )
+    ):
+        score += 10
+
+        reasons.append(
+            "Scheme contains financial-distress "
+            "assistance signals."
+        )
+
+    # --------------------------------------------------------
+    # STUDENT-SPECIFIC SCHEMES
+    # --------------------------------------------------------
+
+    student_terms = [
+        "student",
+        "students",
+        "scholarship",
+        "education scholarship",
+    ]
+
+    student_specific = any(
+        _contains_phrase(
+            text,
+            term,
+        )
+        for term in student_terms
+    )
+
+    if (
+        profile.is_student
+        and student_specific
+    ):
+        score += 15
+
+        reasons.append(
+            "Scheme contains student or scholarship "
+            "signals matching your profile."
+        )
+
+    elif (
+        not profile.is_student
+        and student_specific
+    ):
+        score -= 18
+
+        warnings.append(
+            "Scheme appears student/education focused "
+            "while your profile says you are not "
+            "currently a student."
+        )
+
+    # --------------------------------------------------------
+    # DISABILITY-SPECIFIC SCHEMES
+    # --------------------------------------------------------
+
+    disability_terms = [
+        "person with disability",
+        "persons with disabilities",
+        "disabled person",
+        "disability",
+        "divyang",
+        "pwd",
+    ]
+
+    disability_specific = any(
+        _contains_phrase(
+            text,
+            term,
+        )
+        for term in disability_terms
+    )
+
+    has_disability = (
+        _normalize(
+            profile.disability
+        )
+        == "yes"
+    )
+
+    if (
+        has_disability
+        and disability_specific
+    ):
+        score += 15
+
+        reasons.append(
+            "Scheme contains disability-related "
+            "support matching your profile."
+        )
+
+    elif (
+        not has_disability
+        and disability_specific
+    ):
+        score -= 25
+
+        warnings.append(
+            "Scheme appears disability-focused while "
+            "your profile does not indicate a disability."
+        )
+
+    # --------------------------------------------------------
+    # MINORITY-SPECIFIC SCHEMES
+    # --------------------------------------------------------
+
+    minority_terms = [
+        "minority",
+        "minorities",
+        "minority community",
+    ]
+
+    minority_specific = any(
+        _contains_phrase(
+            text,
+            term,
+        )
+        for term in minority_terms
+    )
+
+    belongs_to_minority = (
+        _normalize(
+            profile.minority
+        )
+        == "yes"
+    )
+
+    if (
+        belongs_to_minority
+        and minority_specific
+    ):
+        score += 12
+
+        reasons.append(
+            "Scheme contains minority-support signals "
+            "matching your profile."
+        )
+
+    elif (
+        not belongs_to_minority
+        and minority_specific
+    ):
+        score -= 20
+
+        warnings.append(
+            "Scheme appears minority-focused while "
+            "your profile does not indicate minority "
+            "status."
+        )
+
+    # --------------------------------------------------------
+    # GENDER-SPECIFIC SCHEMES
+    # --------------------------------------------------------
+
+    female_terms = [
+        "women only",
+        "woman only",
+        "for women",
+        "female beneficiary",
+        "women beneficiaries",
+        "girl child",
+    ]
+
+    female_specific = any(
+        _contains_phrase(
+            text,
+            term,
+        )
+        for term in female_terms
+    )
+
+    if female_specific:
+        if (
+            _normalize(
+                profile.gender
+            )
+            == "female"
+        ):
+            score += 12
+
+            reasons.append(
+                "Scheme contains women-focused support "
+                "matching your profile."
+            )
+
+        elif (
+            _normalize(
+                profile.gender
+            )
+            == "male"
+        ):
+            score -= 30
+
+            warnings.append(
+                "Scheme appears women-specific while "
+                "your profile gender is Male."
+            )
+
+    # --------------------------------------------------------
+    # ARTISAN-SPECIFIC MISMATCH
+    # --------------------------------------------------------
+
+    artisan_terms = [
+        "artisan",
+        "artisans",
+        "handicraft",
+        "handloom",
+        "weaver",
+        "craftsperson",
+    ]
+
+    artisan_specific = any(
+        _contains_phrase(
+            text,
+            term,
+        )
+        for term in artisan_terms
+    )
+
+    profile_is_artisan = any(
+        _contains_phrase(
+            profile_terms,
+            term,
+        )
+        for term in artisan_terms
+    )
+
+    if (
+        artisan_specific
+        and not profile_is_artisan
+    ):
+        score -= 15
+
+        warnings.append(
+            "Scheme appears artisan/handicraft focused "
+            "and that livelihood is not present in "
+            "your profile."
+        )
+
+    # --------------------------------------------------------
+    # FARMER-SPECIFIC MISMATCH
+    # --------------------------------------------------------
+
+    farmer_terms = [
+        "farmer",
+        "farmers",
+        "agriculture",
+        "agricultural",
+        "kisan",
+        "cultivation",
+    ]
+
+    farmer_specific = any(
+        _contains_phrase(
+            text,
+            term,
+        )
+        for term in farmer_terms
+    )
+
+    profile_is_farmer = any(
+        _contains_phrase(
+            profile_terms,
+            term,
+        )
+        for term in farmer_terms
+    )
+
+    if (
+        farmer_specific
+        and not profile_is_farmer
+    ):
+        score -= 10
+
+        warnings.append(
+            "Scheme appears agriculture/farmer focused "
+            "but farming is not present in your profile."
+        )
+
+    # --------------------------------------------------------
+    # FINAL SCORE
+    # --------------------------------------------------------
+
+    score = max(
+        0,
+        min(
+            100,
+            score,
+        ),
+    )
+
+    if score >= 70:
+        fit_label = "Strong fit"
+
+    elif score >= 45:
+        fit_label = "Possible fit"
+
+    else:
+        fit_label = "Weak fit"
+
+    if not reasons:
+        reasons.append(
+            "Returned by live myScheme for the "
+            "submitted profile."
+        )
+
+    return {
+        "fit_score": score,
+        "fit_label": fit_label,
+        "fit_reasons": reasons,
+        "fit_warnings": warnings,
+        "matched_skills": matched_skills,
+        "occupation_group_match": (
+            occupation_group_match
+        ),
+    }
+
+
+# ============================================================
+# LIVE SCHEME -> UI ITEM
+# ============================================================
+
+def _scheme_to_retrieved_item(
+    scheme,
+    profile=None,
+):
     scheme_name = (
-        scheme.get("scheme_name")
-        or scheme.get("name")
+        scheme.get(
+            "scheme_name"
+        )
+        or scheme.get(
+            "name"
+        )
         or "Government Scheme"
     )
 
     description = (
-        scheme.get("description")
+        scheme.get(
+            "description"
+        )
         or ""
     )
 
     benefits = (
-        scheme.get("benefits")
+        scheme.get(
+            "benefits"
+        )
         or ""
     )
 
     eligibility = (
-        scheme.get("eligibility_signals")
+        scheme.get(
+            "eligibility_signals"
+        )
         or ""
     )
 
     application_info = (
-        scheme.get("application_info")
+        scheme.get(
+            "application_info"
+        )
         or ""
     )
 
     text_parts = []
 
     if description:
-        text_parts.append(description)
+        text_parts.append(
+            description
+        )
 
     if eligibility:
         text_parts.append(
-            f"Eligibility: {eligibility}"
+            f"Eligibility information: "
+            f"{eligibility}"
         )
 
     if benefits:
@@ -254,10 +1032,13 @@ def _scheme_to_retrieved_item(scheme):
 
     if application_info:
         text_parts.append(
-            f"Application: {application_info}"
+            f"Application: "
+            f"{application_info}"
         )
 
-    text = "\n\n".join(text_parts)
+    text = "\n\n".join(
+        text_parts
+    )
 
     if not text:
         text = (
@@ -265,79 +1046,177 @@ def _scheme_to_retrieved_item(scheme):
             "by the official myScheme service."
         )
 
-    return {
+    item = {
         "scheme_name": scheme_name,
         "text": text,
+
         "source": scheme.get(
             "source",
             "myScheme",
         ),
+
         "url": scheme.get(
             "url",
             "",
         ),
+
         "state": scheme.get(
             "state",
             "",
         ),
+
         "category": scheme.get(
             "category",
             "",
         ),
+
         "fetched_at": scheme.get(
             "fetched_at",
             "",
         ),
-        "ranking_method": "live_fallback",
+
+        "ranking_method": (
+            "profile_fit"
+        ),
     }
 
+    if profile is not None:
+        fit = evaluate_scheme_fit(
+            scheme,
+            profile,
+        )
 
-def _live_scheme_fallback(
+        item.update(
+            fit
+        )
+
+    return item
+
+
+# ============================================================
+# PROFILE-FIT RANKING
+# ============================================================
+
+def _rank_live_schemes(
     schemes,
-    limit=5,
+    profile,
 ):
-    """
-    Demo-safe fallback.
-
-    These are NOT invented schemes.
-    They are the schemes already returned by live myScheme.
-    """
-
-    results = []
+    ranked = []
 
     seen = set()
 
     for scheme in schemes:
-        url = scheme.get(
-            "url",
-            "",
-        )
+        url = str(
+            scheme.get(
+                "url",
+                "",
+            )
+        ).strip()
 
-        name = scheme.get(
-            "scheme_name",
-            "",
-        )
+        name = str(
+            scheme.get(
+                "scheme_name",
+                scheme.get(
+                    "name",
+                    "",
+                ),
+            )
+        ).strip()
 
         identity = (
             url
-            or name
+            or name.lower()
         )
+
+        if not identity:
+            continue
 
         if identity in seen:
             continue
 
-        seen.add(identity)
+        seen.add(
+            identity
+        )
 
-        results.append(
+        item = (
             _scheme_to_retrieved_item(
-                scheme
+                scheme,
+                profile=profile,
             )
         )
 
-        if len(results) >= limit:
-            break
+        ranked.append(
+            item
+        )
 
-    return results
+    ranked.sort(
+        key=lambda item: (
+            item.get(
+                "fit_score",
+                0,
+            )
+        ),
+        reverse=True,
+    )
+
+    return ranked
+
+
+# ============================================================
+# MAP RAG RESULTS TO LIVE SCHEMES
+# ============================================================
+
+def _find_live_scheme(
+    rag_item,
+    schemes,
+):
+    rag_url = _normalize(
+        rag_item.get(
+            "url",
+            "",
+        )
+    )
+
+    rag_name = _normalize(
+        rag_item.get(
+            "scheme_name",
+            "",
+        )
+    )
+
+    for scheme in schemes:
+        live_url = _normalize(
+            scheme.get(
+                "url",
+                "",
+            )
+        )
+
+        live_name = _normalize(
+            scheme.get(
+                "scheme_name",
+                scheme.get(
+                    "name",
+                    "",
+                ),
+            )
+        )
+
+        if (
+            rag_url
+            and live_url
+            and rag_url == live_url
+        ):
+            return scheme
+
+        if (
+            rag_name
+            and live_name
+            and rag_name == live_name
+        ):
+            return scheme
+
+    return None
 
 
 # ============================================================
@@ -351,6 +1230,7 @@ def get_livelihood_schemes(
     result = {
         "schemes": [],
         "retrieved": [],
+        "all_ranked": [],
         "indexed_chunks": 0,
         "error": "",
         "ranking_method": "",
@@ -360,7 +1240,6 @@ def get_livelihood_schemes(
         result["error"] = (
             "Create your livelihood profile first."
         )
-
         return result
 
     try:
@@ -375,16 +1254,18 @@ def get_livelihood_schemes(
             "Could not prepare myScheme profile: "
             f"{exc}"
         )
-
         return result
 
     print()
     print("=" * 60)
-    print("LIVELIHOOD -> LIVE MYSCHEME")
+    print(
+        "LIVELIHOOD -> LIVE MYSCHEME "
+        "-> PROFILE FIT -> RAG"
+    )
     print("=" * 60)
 
     # --------------------------------------------------------
-    # STEP 1: LIVE MYSCHEME
+    # 1. LIVE MYSCHEME
     # --------------------------------------------------------
 
     try:
@@ -394,11 +1275,8 @@ def get_livelihood_schemes(
 
     except Exception as exc:
         print(
-            "myScheme exception:"
-        )
-
-        print(
-            repr(exc)
+            "myScheme exception:",
+            repr(exc),
         )
 
         result["error"] = (
@@ -419,44 +1297,59 @@ def get_livelihood_schemes(
         return result
 
     print(
-        "Live schemes received:",
+        "Live schemes:",
         len(schemes),
     )
 
     # --------------------------------------------------------
-    # STEP 2: CREATE SAFE FALLBACK FIRST
+    # 2. PROFILE FIT ALL LIVE SCHEMES
     # --------------------------------------------------------
 
-    fallback_results = (
-        _live_scheme_fallback(
+    all_ranked = (
+        _rank_live_schemes(
             schemes,
-            limit=limit,
+            profile,
         )
     )
 
-    # We set this immediately.
-    #
-    # Therefore even if embeddings/ChromaDB explode later,
-    # the UI STILL has real live schemes to display.
+    result["all_ranked"] = (
+        all_ranked
+    )
+
+    print()
+    print(
+        "PROFILE FIT RESULTS"
+    )
+
+    for item in all_ranked:
+        print(
+            item.get(
+                "fit_score"
+            ),
+            item.get(
+                "fit_label"
+            ),
+            "-",
+            item.get(
+                "scheme_name"
+            ),
+        )
+
+    # Safe fallback = best profile-fit schemes.
 
     result["retrieved"] = (
-        fallback_results
+        all_ranked[:limit]
     )
 
     result["ranking_method"] = (
-        "live_myscheme_fallback"
+        "profile_fit"
     )
 
     # --------------------------------------------------------
-    # STEP 3: TRY RAG
+    # 3. INDEX LIVE SCHEMES
     # --------------------------------------------------------
 
     try:
-        print()
-        print(
-            "Attempting RAG indexing..."
-        )
-
         indexed_chunks = (
             index_schemes(
                 schemes
@@ -468,42 +1361,33 @@ def get_livelihood_schemes(
         )
 
         print(
-            "Indexed RAG chunks:",
+            "Indexed chunks:",
             indexed_chunks,
         )
 
     except Exception as exc:
-        print()
         print(
-            "RAG indexing unavailable."
+            "RAG indexing unavailable:",
+            repr(exc),
         )
 
-        print(
-            "Using live myScheme fallback."
-        )
-
-        print(
-            repr(exc)
-        )
-
-        # IMPORTANT:
-        # This is NOT fatal.
-        # Live government schemes are already available.
-
+        # Profile-fit results are already available.
         result["error"] = ""
 
         return result
 
     # --------------------------------------------------------
-    # STEP 4: SEMANTIC QUERY
+    # 4. RAG QUERY
     # --------------------------------------------------------
 
     query_parts = [
         profile.occupation,
         profile.target_role,
+
         " ".join(
             profile.skills
         ),
+
         profile.education,
         profile.state,
         profile.residence,
@@ -518,6 +1402,12 @@ def get_livelihood_schemes(
         (
             "economic distress"
             if profile.is_economic_distress
+            else ""
+        ),
+
+        (
+            "student scholarship"
+            if profile.is_student
             else ""
         ),
 
@@ -540,54 +1430,236 @@ def get_livelihood_schemes(
     )
 
     # --------------------------------------------------------
-    # STEP 5: TRY SEMANTIC RETRIEVAL
+    # 5. RETRIEVE MORE THAN FINAL LIMIT
     # --------------------------------------------------------
 
     try:
-        retrieved = retrieve_schemes(
-            query,
-            top_k=limit,
+        rag_results = (
+            retrieve_schemes(
+                query,
+                top_k=max(
+                    10,
+                    limit * 2,
+                ),
+            )
         )
-
-        if retrieved:
-            result["retrieved"] = (
-                retrieved
-            )
-
-            result["ranking_method"] = (
-                "rag_semantic"
-            )
-
-            print(
-                "RAG recommendations:",
-                len(retrieved),
-            )
-
-        else:
-            print(
-                "RAG returned zero results."
-            )
-
-            print(
-                "Keeping live myScheme fallback."
-            )
 
     except Exception as exc:
-        print()
         print(
-            "RAG retrieval unavailable."
+            "RAG retrieval unavailable:",
+            repr(exc),
         )
 
+        result["error"] = ""
+        return result
+
+    if not rag_results:
         print(
-            "Keeping live myScheme fallback."
+            "RAG returned zero results. "
+            "Using profile-fit ranking."
         )
 
-        print(
-            repr(exc)
+        return result
+
+    # --------------------------------------------------------
+    # 6. COMBINE RAG + PROFILE FIT
+    # --------------------------------------------------------
+
+    combined = []
+
+    seen = set()
+
+    total_rag = len(
+        rag_results
+    )
+
+    for rag_index, rag_item in enumerate(
+        rag_results
+    ):
+        live_scheme = (
+            _find_live_scheme(
+                rag_item,
+                schemes,
+            )
         )
 
-    # RAG failure is NOT an app failure.
+        if live_scheme is None:
+            continue
+
+        item = (
+            _scheme_to_retrieved_item(
+                live_scheme,
+                profile=profile,
+            )
+        )
+
+        identity = (
+            item.get(
+                "url"
+            )
+            or item.get(
+                "scheme_name",
+                "",
+            ).lower()
+        )
+
+        if identity in seen:
+            continue
+
+        seen.add(
+            identity
+        )
+
+        # Higher-ranked semantic result gets
+        # a small bonus.
+        rag_bonus = max(
+            0,
+            15 - (
+                rag_index * 2
+            ),
+        )
+
+        item[
+            "rag_bonus"
+        ] = rag_bonus
+
+        item[
+            "combined_score"
+        ] = min(
+            100,
+            item.get(
+                "fit_score",
+                0,
+            )
+            + rag_bonus,
+        )
+
+        item[
+            "ranking_method"
+        ] = (
+            "profile_fit_plus_rag"
+        )
+
+        combined.append(
+            item
+        )
+
+    # --------------------------------------------------------
+    # 7. INCLUDE LIVE SCHEMES RAG MAY HAVE MISSED
+    # --------------------------------------------------------
+
+    for item in all_ranked:
+        identity = (
+            item.get(
+                "url"
+            )
+            or item.get(
+                "scheme_name",
+                "",
+            ).lower()
+        )
+
+        if identity in seen:
+            continue
+
+        seen.add(
+            identity
+        )
+
+        copy_item = dict(
+            item
+        )
+
+        copy_item[
+            "rag_bonus"
+        ] = 0
+
+        copy_item[
+            "combined_score"
+        ] = copy_item.get(
+            "fit_score",
+            0,
+        )
+
+        combined.append(
+            copy_item
+        )
+
+    # --------------------------------------------------------
+    # 8. FINAL SORT
+    # --------------------------------------------------------
+
+    combined.sort(
+        key=lambda item: (
+            item.get(
+                "combined_score",
+                item.get(
+                    "fit_score",
+                    0,
+                ),
+            )
+        ),
+        reverse=True,
+    )
+
+    result["all_ranked"] = (
+        combined
+    )
+
+    # Recommended section.
+    #
+    # Prefer Strong + Possible fits.
+    recommended = [
+        item
+        for item in combined
+        if item.get(
+            "fit_label"
+        )
+        in {
+            "Strong fit",
+            "Possible fit",
+        }
+    ]
+
+    # Never leave UI empty merely because
+    # all scores are weak.
+    if not recommended:
+        recommended = combined
+
+    result["retrieved"] = (
+        recommended[:limit]
+    )
+
+    result["ranking_method"] = (
+        "profile_fit_plus_rag"
+    )
+
     result["error"] = ""
+
+    print()
+    print(
+        "FINAL RECOMMENDATIONS:"
+    )
+
+    for item in result[
+        "retrieved"
+    ]:
+        print(
+            item.get(
+                "combined_score",
+                item.get(
+                    "fit_score",
+                    0,
+                ),
+            ),
+            item.get(
+                "fit_label"
+            ),
+            "-",
+            item.get(
+                "scheme_name"
+            ),
+        )
 
     return result
 
@@ -596,7 +1668,9 @@ def get_livelihood_schemes(
 # PROFILE SUMMARY
 # ============================================================
 
-def get_livelihood_summary(profile):
+def get_livelihood_summary(
+    profile,
+):
     if profile is None:
         return {}
 
@@ -633,30 +1707,14 @@ def get_livelihood_summary(profile):
         ),
 
         "skills": skills,
-
-        "experience": (
-            profile.experience
-        ),
-
+        "experience": profile.experience,
         "work_preference": (
             profile.work_preference
         ),
-
-        "language": (
-            profile.language
-        ),
-
-        "caste": (
-            profile.caste
-        ),
-
-        "disability": (
-            profile.disability
-        ),
-
-        "minority": (
-            profile.minority
-        ),
+        "language": profile.language,
+        "caste": profile.caste,
+        "disability": profile.disability,
+        "minority": profile.minority,
 
         "employment_status": (
             profile.employment_status
@@ -666,9 +1724,7 @@ def get_livelihood_summary(profile):
             profile.marital_status
         ),
 
-        "is_bpl": (
-            profile.is_bpl
-        ),
+        "is_bpl": profile.is_bpl,
 
         "is_economic_distress": (
             profile.is_economic_distress

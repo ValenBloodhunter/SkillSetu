@@ -1,127 +1,199 @@
-import requests
+"""
+SkillSetu - Live Job Data Source
+
+Arbeitnow is used only as a LIVE job source.
+
+IMPORTANT:
+This module does NOT decide whether a job is a good
+recommendation. The shared matching_engine() does ranking.
+
+We deliberately avoid aggressive filtering here because
+filtering the API response too early can remove all jobs.
+"""
+
 from datetime import datetime, timezone
 
+import requests
+from bs4 import BeautifulSoup
 
-ARBEITNOW_API = "https://www.arbeitnow.com/api/job-board-api"
+
+ARBEITNOW_API = (
+    "https://www.arbeitnow.com/api/job-board-api"
+)
+
+
+def _clean_html(value):
+    """Convert HTML descriptions into plain text."""
+
+    if not value:
+        return ""
+
+    try:
+        return BeautifulSoup(
+            str(value),
+            "html.parser",
+        ).get_text(
+            " ",
+            strip=True,
+        )
+
+    except Exception:
+        return str(value)
+
+
+def _normalize_tags(tags):
+    """Normalize job tags into a clean list."""
+
+    if not tags:
+        return []
+
+    if isinstance(tags, list):
+        return [
+            str(tag).strip()
+            for tag in tags
+            if str(tag).strip()
+        ]
+
+    return [
+        str(tags).strip()
+    ]
 
 
 def _normalize_job(job):
-    """Convert an Arbeitnow job into our shared job format."""
+    """
+    Convert Arbeitnow's response into the common
+    SkillSetu opportunity format.
+    """
 
     return {
-        "id": str(job.get("slug") or job.get("id") or ""),
-        "title": str(job.get("title") or "").strip(),
-        "company": str(job.get("company_name") or "").strip(),
-        "location": str(job.get("location") or "").strip(),
-        "remote": bool(job.get("remote", False)),
-        "description": str(job.get("description") or "").strip(),
-        "tags": [
-            str(tag).strip().lower()
-            for tag in job.get("tags", [])
-            if str(tag).strip()
-        ],
-        "url": str(job.get("url") or "").strip(),
-        "source": "Arbeitnow",
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "id": (
+            job.get("slug")
+            or job.get("id")
+            or ""
+        ),
+
+        "slug": (
+            job.get("slug")
+            or ""
+        ),
+
+        "title": (
+            job.get("title")
+            or "Untitled Opportunity"
+        ),
+
+        "company": (
+            job.get("company_name")
+            or job.get("company")
+            or "Not specified"
+        ),
+
+        "location": (
+            job.get("location")
+            or "Not specified"
+        ),
+
+        "remote": bool(
+            job.get("remote", False)
+        ),
+
+        "description": _clean_html(
+            job.get("description", "")
+        ),
+
+        "tags": _normalize_tags(
+            job.get("tags", [])
+        ),
+
+        "url": (
+            job.get("url")
+            or ""
+        ),
+
+        "source": "Arbeitnow Live API",
+
+        "fetched_at": datetime.now(
+            timezone.utc
+        ).strftime(
+            "%Y-%m-%d %H:%M UTC"
+        ),
+
+        # Arbeitnow does not reliably provide
+        # structured experience requirements.
+        "experience": "",
     }
-
-
-def _job_matches_profile(job, profile):
-    """Check whether a job has some relevance to the user's profile."""
-
-    if profile is None:
-        return True
-
-    profile_skills = {
-        skill.strip().lower()
-        for skill in getattr(profile, "skills", [])
-        if skill.strip()
-    }
-
-    job_text = " ".join([
-        job.get("title", ""),
-        job.get("description", ""),
-        " ".join(job.get("tags", [])),
-    ]).lower()
-
-    skill_match = any(
-        skill in job_text
-        for skill in profile_skills
-    )
-
-    role = getattr(profile, "target_role", "").strip().lower()
-
-    role_match = role and role in job_text
-
-    location = getattr(profile, "location", "").strip().lower()
-    job_location = job.get("location", "").lower()
-
-    location_match = (
-        location
-        and location in job_location
-    )
-
-    remote_preference = (
-        getattr(profile, "work_preference", "")
-        .strip()
-        .lower()
-    )
-
-    remote_match = (
-        remote_preference == "remote"
-        and job.get("remote", False)
-    )
-
-    return bool(
-        skill_match
-        or role_match
-        or location_match
-        or remote_match
-    )
 
 
 def fetch_jobs(profile=None):
     """
-    Fetch live jobs from Arbeitnow.
+    Fetch LIVE jobs.
 
-    If a profile is provided, return jobs relevant to that profile.
-    If no profile is provided, return all normalized jobs.
+    We intentionally return the normalized live feed
+    without doing profile filtering here.
+
+    Why?
+
+    Previously SkillSetu used checks such as:
+
+        skill_match OR role_match OR location_match
+
+    That caused false positives.
+
+    Example:
+        Skill = "Driving"
+
+    could accidentally match:
+        "driving business insights"
+
+    inside a Data Scientist description.
+
+    Profile relevance must therefore be handled by the
+    shared matching_engine() and the presentation layer,
+    not by loose substring filtering in the data source.
     """
 
     try:
         response = requests.get(
             ARBEITNOW_API,
-            timeout=10
+            timeout=10,
+            headers={
+                "User-Agent": (
+                    "SkillSetu-Hackathon/1.0"
+                )
+            },
         )
 
         response.raise_for_status()
 
-        data = response.json()
+        payload = response.json()
 
-        jobs = data.get("data", [])
+        raw_jobs = payload.get(
+            "data",
+            [],
+        )
 
-        normalized_jobs = [
-            _normalize_job(job)
-            for job in jobs
-            if isinstance(job, dict)
-        ]
+        normalized_jobs = []
 
-        if profile is None:
-            return normalized_jobs
+        for job in raw_jobs:
+            try:
+                normalized = (
+                    _normalize_job(job)
+                )
 
-        filtered_jobs = [
-            job
-            for job in normalized_jobs
-            if _job_matches_profile(job, profile)
-        ]
+                if normalized.get("title"):
+                    normalized_jobs.append(
+                        normalized
+                    )
 
-        return filtered_jobs
+            except Exception:
+                continue
 
-    except requests.RequestException:
-        return []
+        return normalized_jobs
 
-    except (ValueError, TypeError):
-        return []
+    except Exception as exc:
+        print(
+            "SkillSetu job fetch error:",
+            exc,
+        )
 
-    except Exception:
         return []
