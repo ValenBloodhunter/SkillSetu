@@ -302,7 +302,9 @@ with assessment_tab:
             "your current confidence."
         )
 
-        questions = get_skill_assessment_questions()
+        questions = get_skill_assessment_questions(
+            st.session_state.profile
+        )
 
         responses = {}
 
